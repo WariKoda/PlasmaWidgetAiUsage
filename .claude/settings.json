@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // empty' | { read -r f; out=\"\"; case \"$f\" in *.qml) result=$(/usr/lib/qt6/bin/qmllint \"$f\" 2>&1) || out=\"$result\" ;; *.py|*/ai-usage-json) result=$(python3 -m py_compile \"$f\" 2>&1) || out=\"$result\" ;; *) exit 0 ;; esac; [ -n \"$out\" ] && jq -n --arg o \"$out\" '{hookSpecificOutput:{hookEventName:\"PostToolUse\",additionalContext:(\"Lint failed for edited file:\\n\"+$o)}}'; exit 0; }",
+            "timeout": 30,
+            "statusMessage": "Linting edited file…"
+          }
+        ]
+      }
+    ]
+  }
+}

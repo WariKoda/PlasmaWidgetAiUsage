@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+*.swp
+.DS_Store
+
+# Build artefacts
+*.plasmoid
+
+# Claude Code — personal, not shared
+CLAUDE.local.md
+.claude/settings.local.json

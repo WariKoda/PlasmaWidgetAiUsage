@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="showClaude" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showCodex" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="showAntigravity" type="Bool">
+      <default>true</default>
+    </entry>
+
+    <entry name="refreshIntervalSec" type="Int">
+      <default>120</default>
+      <min>15</min>
+    </entry>
+
+    <entry name="warnThreshold" type="Int">
+      <default>75</default>
+      <min>1</min>
+      <max>100</max>
+    </entry>
+    <entry name="critThreshold" type="Int">
+      <default>90</default>
+      <min>1</min>
+      <max>100</max>
+    </entry>
+
+    <entry name="showResetInCompact" type="Bool">
+      <default>true</default>
+    </entry>
+
+    <entry name="claudeLocalFallback" type="Bool">
+      <default>true</default>
+    </entry>
+    <entry name="claudeCap5h" type="Int">
+      <default>0</default>
+      <min>0</min>
+    </entry>
+    <entry name="claudeCap7d" type="Int">
+      <default>0</default>
+      <min>0</min>
+    </entry>
+
+    <entry name="claudeTokenOverride" type="String">
+      <default></default>
+    </entry>
+  </group>
+</kcfg>

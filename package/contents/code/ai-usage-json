@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""ai-usage-json -- emit unified AI coding assistant usage as a single JSON object.
+
+Providers:
+  * claude  -- Anthropic OAuth usage API (real utilization) with a local
+               token-estimate fallback parsed straight from ~/.claude/projects.
+  * codex   -- OpenAI Codex CLI: latest ~/.codex/sessions rollout file, last
+               token_count event (rate_limits.primary/secondary). Purely local.
+  * antigravity -- Google Antigravity CLI/IDE: queries the local `agy` language
+               server's getUserStatus Connect RPC for real per-model quota and
+               prompt credits. Local-only; "unavailable" when agy is not running
+               (never a fabricated number).
+
+stdlib only. Configuration via environment variables (see env_* helpers) so the
+Plasma applet can invoke it as `VAR=... ai-usage-json`.
+
+Output schema (stable contract for the QML frontend):
+
+  {
+    "generated_at": <unix int>,
+    "providers": [
+      {
+        "id": "claude", "label": "Claude",
+        "available": true|false,
+        "source": "api" | "local-estimate" | "local-session" | null,
+        "plan": "max" | "plus" | ... | null,
+        "windows": [
+          {"key": "5h", "label": "5-Hour",
+           "used_percent": 34.0 | null,
+           "resets_at": <unix int> | null,
+           "detail": "optional string shown when used_percent is null"}
+        ],
+        "error": null | "human readable reason"
+      }
+    ]
+  }
+
+A window with used_percent == null is an explicit "no real percentage" state.
+The frontend MUST render it as such (e.g. the `detail` text or "n/a"), never as
+0 %. Likewise available == false means: show the provider greyed-out with its
+`error` as the reason. We never emit a guessed utilization value.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+CLAUDE_CREDENTIALS = os.path.expanduser("~/.claude/.credentials.json")
+CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
+
+HTTP_TIMEOUT = 10
+
+# Shared on-disk cache for the Claude usage API. Multiple widget instances
+# (panel + desktop) read/write the same file, so the API is hit at most once per
+# CLAUDE_CACHE_TTL regardless of how many instances poll -- this is what keeps us
+# under the endpoint's rate limit (otherwise each instance polls independently
+# and we get HTTP 429). On failure the last good response is served (marked
+# stale) instead of dropping to a null estimate.
+CACHE_DIR = os.path.expanduser("~/.cache/plasma-ai-usage")
+CLAUDE_CACHE = os.path.join(CACHE_DIR, "claude-usage.json")
+CLAUDE_CACHE_TTL = 60   # seconds a cached API response is reused without refetch
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+def env_str(name: str, default=None):
+    val = os.environ.get(name)
+    return val if val not in (None, "") else default
+
+
+def env_int(name: str, default=None):
+    val = os.environ.get(name)
+    if val in (None, ""):
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val in (None, ""):
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def read_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def iso_to_epoch(value):
+    """ISO-8601 string -> unix seconds (int) or None. Tolerates 'Z' suffix."""
+    if not value:
+        return None
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def window(key, label, used_percent, resets_at, detail=None):
+    win = {
+        "key": key,
+        "label": label,
+        "used_percent": round(float(used_percent), 1) if used_percent is not None else None,
+        "resets_at": int(resets_at) if resets_at is not None else None,
+    }
+    if detail:
+        win["detail"] = detail
+    return win
+
+
+def provider(pid, label, available, source, plan, windows, error):
+    return {
+        "id": pid,
+        "label": label,
+        "available": available,
+        "source": source,
+        "plan": plan,
+        "windows": windows,
+        "error": error,
+    }
+
+
+def http_get_json(url, token, timeout=HTTP_TIMEOUT):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "User-Agent": "plasma-ai-usage",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def humanize_tokens(n):
+    if n >= 1_000_000:
+        return f"~{n / 1_000_000:.1f}M tok"
+    if n >= 1_000:
+        return f"~{n / 1_000:.0f}k tok"
+    return f"~{n} tok"
+
+
+# --------------------------------------------------------------------------- #
+# Claude
+# --------------------------------------------------------------------------- #
+# Real response shape verified live against the OAuth usage endpoint:
+#   {"five_hour": {"utilization": 34.0, "resets_at": "...+00:00"},
+#    "seven_day": {"utilization": 11.0, "resets_at": "..."},
+#    "seven_day_opus": null, "seven_day_sonnet": {...}, "extra_usage": {...}}
+CLAUDE_API_WINDOWS = [
+    ("5h", "5-Hour", "five_hour"),
+    ("7d", "7-Day", "seven_day"),
+]
+CLAUDE_API_EXTRA = [
+    ("7d-opus", "7-Day Opus", "seven_day_opus"),
+    ("7d-sonnet", "7-Day Sonnet", "seven_day_sonnet"),
+]
+
+
+def claude_from_api(data):
+    windows = []
+    for key, label, src in CLAUDE_API_WINDOWS:
+        blk = data.get(src)
+        if isinstance(blk, dict) and blk.get("utilization") is not None:
+            windows.append(window(key, label, blk["utilization"], iso_to_epoch(blk.get("resets_at"))))
+    for key, label, src in CLAUDE_API_EXTRA:
+        blk = data.get(src)
+        if isinstance(blk, dict) and blk.get("utilization") is not None:
+            windows.append(window(key, label, blk["utilization"], iso_to_epoch(blk.get("resets_at"))))
+    return windows
+
+
+def claude_local_estimate(cap_5h, cap_7d):
+    """Best-effort offline estimate parsed directly from ~/.claude/projects.
+
+    Sums every integer field found inside `message.usage` (input/output/cache
+    tokens) per record, bucketed into the 5h and 7d windows by the record
+    timestamp. We deliberately sum *whatever* numeric usage fields exist rather
+    than hard-coding key names. Returns (windows, total_files) or None when no
+    usage data is present at all (so the caller can fail honestly).
+    """
+    if not os.path.isdir(CLAUDE_PROJECTS):
+        return None
+
+    now = time.time()
+    cut_5h = now - 5 * 3600
+    cut_7d = now - 7 * 86400
+    sum_5h = 0
+    sum_7d = 0
+    found = False
+
+    for path in glob.iglob(os.path.join(CLAUDE_PROJECTS, "**", "*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(path) < cut_7d:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"usage"' not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    msg = obj.get("message")
+                    usage = msg.get("usage") if isinstance(msg, dict) else None
+                    if not isinstance(usage, dict):
+                        continue
+                    ts = iso_to_epoch(obj.get("timestamp"))
+                    if ts is None or ts < cut_7d:
+                        continue
+                    tokens = sum(v for v in usage.values() if isinstance(v, int))
+                    if tokens <= 0:
+                        continue
+                    found = True
+                    sum_7d += tokens
+                    if ts >= cut_5h:
+                        sum_5h += tokens
+        except OSError:
+            continue
+
+    if not found:
+        return None
+
+    windows = []
+    for key, label, total, cap in (
+        ("5h", "5-Hour", sum_5h, cap_5h),
+        ("7d", "7-Day", sum_7d, cap_7d),
+    ):
+        if cap and cap > 0:
+            windows.append(window(key, label, min(100.0, total / cap * 100.0), None,
+                                  detail=humanize_tokens(total)))
+        else:
+            windows.append(window(key, label, None, None,
+                                  detail=humanize_tokens(total) + " (no cap set)"))
+    return windows
+
+
+def read_cache(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_cache(path, obj):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def parse_retry_after(http_error):
+    """Retry-After header in seconds, or None when absent/non-numeric (we do not
+    parse the HTTP-date form -- a default backoff is applied instead)."""
+    try:
+        value = http_error.headers.get("Retry-After")
+        return int(value) if value is not None else None
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def provider_claude(cfg):
+    creds = read_json(CLAUDE_CREDENTIALS) or {}
+    oauth = creds.get("claudeAiOauth") or {}
+    token = cfg["claude_token"] or oauth.get("accessToken")
+    plan = oauth.get("subscriptionType")
+
+    now = time.time()
+    cache = read_cache(CLAUDE_CACHE) or {}
+    cached_data = cache.get("data")
+    fetched_at = cache.get("fetched_at", 0)
+    retry_until = cache.get("retry_after_until", 0)
+
+    def from_cache(data, stale):
+        windows = claude_from_api(data)
+        if not windows:
+            return None
+        if not stale:
+            return provider("claude", "Claude", True, "api", plan, windows, None)
+        note = "cached usage (%ds old)" % int(now - fetched_at)
+        return provider("claude", "Claude", True, "api-cached", plan, windows, note)
+
+    # 1) Fresh cache, or we are inside a server-requested backoff window:
+    #    serve the cached response and skip the network entirely. This is what
+    #    lets multiple instances share a single API call.
+    if cached_data is not None and ((now - fetched_at) < CLAUDE_CACHE_TTL or now < retry_until):
+        served = from_cache(cached_data, stale=(now - fetched_at) >= CLAUDE_CACHE_TTL)
+        if served:
+            return served
+
+    # 2) Refresh from the API.
+    api_error = None
+    if token:
+        try:
+            data = http_get_json(CLAUDE_USAGE_URL, token)
+            write_cache(CLAUDE_CACHE, {"fetched_at": now, "data": data, "retry_after_until": 0})
+            served = from_cache(data, stale=False)
+            if served:
+                return served
+            api_error = "usage API returned no usable windows"
+        except urllib.error.HTTPError as exc:
+            api_error = "usage API failed: HTTP Error %s" % exc.code
+            if exc.code == 429:
+                backoff = parse_retry_after(exc) or 120
+                write_cache(CLAUDE_CACHE, {
+                    "fetched_at": fetched_at,
+                    "data": cached_data,
+                    "retry_after_until": now + backoff,
+                })
+        except Exception as exc:  # noqa: BLE001 - any failure -> serve cache / fallback
+            api_error = "usage API failed: %s" % exc
+    else:
+        api_error = "no access token in ~/.claude/.credentials.json"
+
+    # 3) API failed: serve the last good response (stale) rather than a null
+    #    estimate -- a transient 429 should not blank out the widget.
+    if cached_data is not None:
+        served = from_cache(cached_data, stale=True)
+        if served:
+            served["error"] = "%s · %s" % (served["error"], api_error)
+            return served
+
+    # 4) No cache at all: optional local token estimate, else hard error.
+    if cfg["claude_local_fallback"]:
+        estimate = claude_local_estimate(cfg["claude_cap_5h"], cfg["claude_cap_7d"])
+        if estimate is not None:
+            return provider("claude", "Claude", True, "local-estimate", plan, estimate,
+                            f"API unavailable, showing local token estimate ({api_error})")
+
+    return provider("claude", "Claude", False, None, plan, [], api_error)
+
+
+# --------------------------------------------------------------------------- #
+# Codex
+# --------------------------------------------------------------------------- #
+# Real event shape verified on disk (rate_limits lives under payload):
+#   {"type": "event_msg", "timestamp": "...", "payload": {
+#       "type": "token_count",
+#       "rate_limits": {
+#           "primary":   {"used_percent": 9.0, "window_minutes": 300,   "resets_at": 1776855643},
+#           "secondary": {"used_percent": 1.0, "window_minutes": 10080, "resets_at": 1777442443},
+#           "plan_type": "plus", ...}}}
+CODEX_WINDOWS = [
+    ("5h", "5-Hour", "primary"),
+    ("7d", "7-Day", "secondary"),
+]
+
+
+def codex_extract_rate_limits(obj):
+    """Pull the rate_limits block from a rollout line, tolerant of both the
+    nested (payload.rate_limits) and a hypothetical top-level layout."""
+    payload = obj.get("payload")
+    if isinstance(payload, dict) and payload.get("type") == "token_count":
+        rl = payload.get("rate_limits")
+        if isinstance(rl, dict):
+            return rl
+    if obj.get("type") == "token_count" and isinstance(obj.get("rate_limits"), dict):
+        return obj["rate_limits"]
+    return None
+
+
+def codex_latest_rate_limits():
+    """Newest rollout file (by mtime) that carries a rate_limits payload."""
+    if not os.path.isdir(CODEX_SESSIONS):
+        return None
+    files = []
+    for path in glob.iglob(os.path.join(CODEX_SESSIONS, "**", "rollout-*.jsonl"), recursive=True):
+        try:
+            files.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    files.sort(reverse=True)
+
+    for _, path in files[:10]:  # scan the 10 most recent sessions at most
+        rate_limits = None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if '"rate_limits"' not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    found = codex_extract_rate_limits(obj)
+                    if found is not None:
+                        rate_limits = found  # keep last (most recent in file)
+        except OSError:
+            continue
+        if rate_limits:
+            return rate_limits
+    return None
+
+
+def provider_codex(cfg):
+    rate_limits = codex_latest_rate_limits()
+    if not rate_limits:
+        return provider("codex", "Codex", False, None, None, [],
+                        "no rate-limit data found in ~/.codex/sessions")
+    plan = rate_limits.get("plan_type")
+    windows = []
+    for key, label, src in CODEX_WINDOWS:
+        blk = rate_limits.get(src)
+        if isinstance(blk, dict) and blk.get("used_percent") is not None:
+            windows.append(window(key, label, blk["used_percent"], blk.get("resets_at")))
+    if not windows:
+        return provider("codex", "Codex", False, None, plan, [],
+                        "rate-limit payload present but no primary/secondary windows")
+    return provider("codex", "Codex", True, "local-session", plan, windows, None)
+
+
+# --------------------------------------------------------------------------- #
+# Antigravity (successor to the Gemini CLI)
+# --------------------------------------------------------------------------- #
+# The Antigravity CLI/IDE runs a local "language server" (the `agy` process) that
+# answers a Connect RPC with the real, signed-in quota -- the same data the IDE
+# shows. There is no on-disk quota file and the cloud REST endpoint is locked down
+# for consumer accounts, so this local server is the only honest source. It only
+# runs while Antigravity is open and listens on a RANDOM localhost port per launch
+# (discovered here via `ss`), so when Antigravity is not running we report the
+# provider unavailable rather than guessing. Verified live: the RPC needs no CSRF
+# token. Response shape (subset):
+#   {"userStatus": {"planStatus": {"planInfo": {"planName": "Pro",
+#         "monthlyPromptCredits": 50000}, "availablePromptCredits": 500},
+#     "cascadeModelConfigData": {"clientModelConfigs": [
+#         {"label": "...", "modelOrAlias": {"model": "..."},
+#          "quotaInfo": {"remainingFraction": 1.0, "resetTime": "...Z"}}]}}}
+ANTIGRAVITY_RPC_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
+ANTIGRAVITY_RPC_BODY = json.dumps(
+    {"metadata": {"ideName": "antigravity", "extensionName": "antigravity", "locale": "en"}}
+).encode("utf-8")
+# Process names (from `ss` socket ownership) that identify the local server.
+ANTIGRAVITY_PROC_HINTS = ("agy", "antigravity", "language_server", "language-server")
+# Last good getUserStatus, so we can still show the last-known quota (marked
+# stale) after Antigravity is closed -- mirrors the Claude api-cached behaviour.
+ANTIGRAVITY_CACHE = os.path.join(CACHE_DIR, "antigravity-usage.json")
+
+
+def antigravity_listening_ports():
+    """Localhost TCP ports owned by the running Antigravity server, via `ss`.
+    Empty list when Antigravity is not running (or `ss` is unavailable)."""
+    try:
+        out = subprocess.run(
+            ["ss", "-ltnpH"], capture_output=True, text=True, timeout=4
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ports = []
+    for line in out.splitlines():
+        names = re.findall(r'\(\("([^"]+)"', line)
+        if not any(any(h in n for h in ANTIGRAVITY_PROC_HINTS) for n in names):
+            continue
+        m = re.search(r"127\.0\.0\.1:(\d+)", line)
+        if m:
+            ports.append(int(m.group(1)))
+    return ports
+
+
+def antigravity_user_status():
+    """Call the local Connect getUserStatus RPC on the discovered port(s).
+    Returns the userStatus dict, or None when the server cannot be reached."""
+    ctx = ssl._create_unverified_context()  # the server presents a self-signed cert
+    for port in antigravity_listening_ports():
+        for scheme in ("https", "http"):
+            url = "%s://127.0.0.1:%d%s" % (scheme, port, ANTIGRAVITY_RPC_PATH)
+            req = urllib.request.Request(
+                url,
+                data=ANTIGRAVITY_RPC_BODY,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Connect-Protocol-Version": "1",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return data.get("userStatus", data)
+            except Exception:  # noqa: BLE001 - wrong scheme/port -> try the next
+                continue
+    return None
+
+
+def antigravity_build(us):
+    """Map a userStatus dict to (plan, windows). Pure (no I/O), so it works the
+    same on a live response or a cached one."""
+    plan_status = us.get("planStatus") or {}
+    plan_info = plan_status.get("planInfo") or {}
+    plan = plan_info.get("planName")
+
+    windows = []
+    # Rolling per-model window: surface the most-constrained model (highest used %)
+    # with its own reset time -- this is the "are you rate-limited right now" signal.
+    worst = None
+    model_cfgs = (us.get("cascadeModelConfigData") or {}).get("clientModelConfigs") or []
+    for m in model_cfgs:
+        qi = m.get("quotaInfo") or {}
+        rf = qi.get("remainingFraction")
+        if not isinstance(rf, (int, float)):
+            continue
+        used = (1.0 - rf) * 100.0
+        if worst is None or used > worst[0]:
+            worst = (used, m.get("label"), iso_to_epoch(qi.get("resetTime")))
+    if worst is not None:
+        windows.append(window("models", "Models", worst[0], worst[2],
+                              detail=worst[1] or None))
+
+    # Monthly prompt-credit pool (a different time scale than the model windows).
+    monthly = plan_info.get("monthlyPromptCredits")
+    avail = plan_status.get("availablePromptCredits")
+    if isinstance(monthly, (int, float)) and monthly > 0 and isinstance(avail, (int, float)):
+        used = (monthly - avail) / monthly * 100.0
+        windows.append(window("credits", "Credits", used, None,
+                              detail="%d / %d credits" % (int(avail), int(monthly))))
+    return plan, windows
+
+
+def provider_antigravity(cfg):
+    now = time.time()
+    us = antigravity_user_status()
+
+    # 1) Live: the agy server answered. Serve fresh and refresh the on-disk cache
+    #    so we can still show the last-known state once Antigravity is closed.
+    if us is not None:
+        write_cache(ANTIGRAVITY_CACHE, {"fetched_at": now, "data": us})
+        plan, windows = antigravity_build(us)
+        if windows:
+            return provider("antigravity", "Antigravity", True, "local-session", plan, windows, None)
+        return provider("antigravity", "Antigravity", False, None, plan, [],
+                        "user status returned no quota windows")
+
+    # 2) Server unreachable (Antigravity not running): serve the last cached status
+    #    -- explicitly marked stale, like the Claude api-cached path, never as fresh.
+    cache = read_cache(ANTIGRAVITY_CACHE) or {}
+    cached = cache.get("data")
+    if cached is not None:
+        plan, windows = antigravity_build(cached)
+        if windows:
+            note = "cached usage (%ds old) · Antigravity not running" % int(now - cache.get("fetched_at", 0))
+            return provider("antigravity", "Antigravity", True, "local-cached", plan, windows, note)
+
+    # 3) No live server and no cache yet.
+    return provider("antigravity", "Antigravity", False, None, None, [],
+                    "Antigravity not running (start the agy CLI or the IDE)")
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+PROVIDERS = {
+    "claude": provider_claude,
+    "codex": provider_codex,
+    "antigravity": provider_antigravity,
+}
+DEFAULT_ORDER = ["claude", "codex", "antigravity"]
+
+
+def load_config():
+    enabled = env_str("AI_USAGE_PROVIDERS", "claude,codex,antigravity")
+    order = [p.strip() for p in enabled.split(",") if p.strip() in PROVIDERS]
+    return {
+        "providers": order or DEFAULT_ORDER,
+        "claude_token": env_str("AI_USAGE_CLAUDE_TOKEN"),
+        "claude_local_fallback": env_bool("AI_USAGE_CLAUDE_LOCAL_FALLBACK", True),
+        "claude_cap_5h": env_int("AI_USAGE_CLAUDE_CAP_5H"),
+        "claude_cap_7d": env_int("AI_USAGE_CLAUDE_CAP_7D"),
+    }
+
+
+def main():
+    cfg = load_config()
+    providers = []
+    for pid in cfg["providers"]:
+        try:
+            providers.append(PROVIDERS[pid](cfg))
+        except Exception as exc:  # noqa: BLE001 - one provider must not break the rest
+            providers.append(provider(pid, pid.capitalize(), False, None, None, [], f"internal error: {exc}"))
+    json.dump({"generated_at": int(time.time()), "providers": providers}, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

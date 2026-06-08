@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a problem with the AI Usage widget
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report. The single most useful thing you can attach is
+        the **helper output** (see the field below) — the widget is a thin QML
+        frontend over one Python helper, so that JSON tells us what it actually saw.
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Affected provider
+      options:
+        - Claude
+        - Codex
+        - Antigravity
+        - Multiple / all
+        - Not provider-specific
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      placeholder: e.g. the Antigravity chip stays on "unavailable" although agy is running.
+    validations:
+      required: true
+  - type: textarea
+    id: helper-output
+    attributes:
+      label: Helper output
+      description: |
+        Run the bundled helper for the affected provider and paste the result:
+        `AI_USAGE_PROVIDERS=claude,codex,antigravity python3 package/contents/code/ai-usage-json | python3 -m json.tool`
+        Redact anything you consider sensitive.
+      render: json
+  - type: input
+    id: plasma
+    attributes:
+      label: Plasma / Qt version
+      placeholder: e.g. Plasma 6.6.5, Qt 6.10
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: Install method
+      placeholder: per-user (install.sh) or system-wide (install.sh --system)
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Distro, Wayland/X11, anything else relevant.
