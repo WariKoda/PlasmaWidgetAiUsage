@@ -139,7 +139,7 @@ PlasmaComponents.Page {
                             elide: Text.ElideRight
                         }
                         PlasmaComponents.Label {
-                            text: Lib.fmtCountdown(wrow.modelData.resets_at, full.nowMs)
+                            text: Lib.fmtCountdown(wrow.modelData.resets_at, full.nowMs, i18n("now"))
                             opacity: 0.8
                             Layout.preferredWidth: full.colWidth
                             horizontalAlignment: Text.AlignRight

@@ -35,7 +35,7 @@ PlasmoidItem {
                         ? Lib.fmtPct(w.used_percent)
                         : (w.detail ? w.detail : "—");
                     parts.push(w.label + " " + val
-                               + " (" + Lib.fmtCountdown(w.resets_at, Date.now()) + ")");
+                               + " (" + Lib.fmtCountdown(w.resets_at, Date.now(), i18n("now")) + ")");
                 }
                 var plan = p.plan ? " · " + p.plan : "";
                 lines.push(p.label + plan + ":\n   " + parts.join("\n   "));
@@ -73,8 +73,10 @@ PlasmoidItem {
         var c7 = Plasmoid.configuration.claudeCap7d;
         if (c5 > 0) env.push("AI_USAGE_CLAUDE_CAP_5H=" + c5);
         if (c7 > 0) env.push("AI_USAGE_CLAUDE_CAP_7D=" + c7);
-        var tok = Plasmoid.configuration.claudeTokenOverride;
-        if (tok && tok.length > 0) env.push("AI_USAGE_CLAUDE_TOKEN=" + shellQuote(tok));
+        // A token *file path*, never the raw token: this string ends up on the
+        // helper's command line, which any local user can read via /proc.
+        var tokFile = Plasmoid.configuration.claudeTokenFile;
+        if (tokFile && tokFile.length > 0) env.push("AI_USAGE_CLAUDE_TOKEN_FILE=" + shellQuote(tokFile));
         return env.join(" ") + " python3 " + shellQuote(helperPath);
     }
 

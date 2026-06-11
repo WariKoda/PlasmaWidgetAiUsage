@@ -48,7 +48,10 @@
       <min>0</min>
     </entry>
 
-    <entry name="claudeTokenOverride" type="String">
+    <!-- Path to a file holding an access token (first line). A path instead of
+         the raw token: the value is passed to the helper on its command line,
+         which is world-readable via /proc while the process runs. -->
+    <entry name="claudeTokenFile" type="String">
       <default></default>
     </entry>
   </group>

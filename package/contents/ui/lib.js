@@ -47,18 +47,18 @@ function fmtPct(pct) {
 
 // Compact reset countdown from a unix-seconds reset timestamp, e.g. "4h44m"
 // or "6d17h". nowMs is Date.now() passed in so callers control the tick.
-function fmtCountdown(epoch, nowMs) {
+// nowLabel is the already-translated "just reset" word, supplied by the caller:
+// this file is a `.pragma library` and has no access to the i18n() context, so
+// the only honest way to keep the string translatable is to inject it from the
+// QML component. Defaults to "now" so the library stays usable standalone.
+function fmtCountdown(epoch, nowMs, nowLabel) {
     if (!epoch) return "—";
     var rem = epoch - Math.floor(nowMs / 1000);
-    if (rem <= 0) return i18nNow();
+    if (rem <= 0) return nowLabel || "now";
     var d = Math.floor(rem / 86400); rem -= d * 86400;
     var h = Math.floor(rem / 3600);  rem -= h * 3600;
     var m = Math.floor(rem / 60);
     if (d > 0) return d + "d" + h + "h";
     if (h > 0) return h + "h" + m + "m";
     return m + "m";
-}
-
-function i18nNow() {
-    return "now";
 }

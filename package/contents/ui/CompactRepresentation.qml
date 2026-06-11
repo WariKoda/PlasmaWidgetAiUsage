@@ -86,7 +86,7 @@ Item {
                 PlasmaComponents.Label {
                     Layout.alignment: Qt.AlignVCenter
                     visible: compact.showReset && chip.w5h && chip.modelData.available
-                    text: chip.w5h ? Lib.fmtCountdown(chip.w5h.resets_at, compact.nowMs) : ""
+                    text: chip.w5h ? Lib.fmtCountdown(chip.w5h.resets_at, compact.nowMs, i18n("now")) : ""
                     opacity: 0.7
                     font.pointSize: Kirigami.Theme.smallFont.pointSize
                 }

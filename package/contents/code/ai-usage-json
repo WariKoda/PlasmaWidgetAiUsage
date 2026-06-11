@@ -275,11 +275,16 @@ def read_cache(path):
 
 
 def write_cache(path, obj):
+    # Cached API payloads can carry account details (the raw Antigravity
+    # userStatus includes the account email/name), so the cache is private:
+    # 0700 on the directory, 0600 on every file we write.
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
+        os.chmod(CACHE_DIR, 0o700)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(obj, fh)
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except OSError:
         pass
@@ -295,11 +300,30 @@ def parse_retry_after(http_error):
         return None
 
 
+def read_token_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
 def provider_claude(cfg):
     creds = read_json(CLAUDE_CREDENTIALS) or {}
     oauth = creds.get("claudeAiOauth") or {}
-    token = cfg["claude_token"] or oauth.get("accessToken")
     plan = oauth.get("subscriptionType")
+
+    # Token precedence: explicit env token > configured token file > the
+    # default ~/.claude/.credentials.json. A configured-but-unreadable token
+    # file is a hard error, not a silent fall-through to the default source.
+    token = cfg["claude_token"]
+    if not token and cfg["claude_token_file"]:
+        token = read_token_file(cfg["claude_token_file"])
+        if not token:
+            return provider("claude", "Claude", False, None, plan, [],
+                            "cannot read token file %s" % cfg["claude_token_file"])
+    if not token:
+        token = oauth.get("accessToken")
 
     now = time.time()
     cache = read_cache(CLAUDE_CACHE) or {}
@@ -592,11 +616,19 @@ DEFAULT_ORDER = ["claude", "codex", "antigravity"]
 
 
 def load_config():
+    # Keep unknown names (instead of filtering them) so a typo surfaces as an
+    # explicit error tile in main() rather than silently expanding to the
+    # default provider set. Duplicates are dropped, order is preserved.
     enabled = env_str("AI_USAGE_PROVIDERS", "claude,codex,antigravity")
-    order = [p.strip() for p in enabled.split(",") if p.strip() in PROVIDERS]
+    order = []
+    for p in enabled.split(","):
+        p = p.strip()
+        if p and p not in order:
+            order.append(p)
     return {
         "providers": order or DEFAULT_ORDER,
         "claude_token": env_str("AI_USAGE_CLAUDE_TOKEN"),
+        "claude_token_file": env_str("AI_USAGE_CLAUDE_TOKEN_FILE"),
         "claude_local_fallback": env_bool("AI_USAGE_CLAUDE_LOCAL_FALLBACK", True),
         "claude_cap_5h": env_int("AI_USAGE_CLAUDE_CAP_5H"),
         "claude_cap_7d": env_int("AI_USAGE_CLAUDE_CAP_7D"),
@@ -607,8 +639,13 @@ def main():
     cfg = load_config()
     providers = []
     for pid in cfg["providers"]:
+        fn = PROVIDERS.get(pid)
+        if fn is None:
+            providers.append(provider(pid, pid.capitalize(), False, None, None, [],
+                                      "unknown provider id (valid: %s)" % ", ".join(PROVIDERS)))
+            continue
         try:
-            providers.append(PROVIDERS[pid](cfg))
+            providers.append(fn(cfg))
         except Exception as exc:  # noqa: BLE001 - one provider must not break the rest
             providers.append(provider(pid, pid.capitalize(), False, None, None, [], f"internal error: {exc}"))
     json.dump({"generated_at": int(time.time()), "providers": providers}, sys.stdout)

@@ -20,7 +20,7 @@ KCM.SimpleKCM {
     property alias cfg_claudeLocalFallback: localFallback.checked
     property alias cfg_claudeCap5h: cap5h.value
     property alias cfg_claudeCap7d: cap7d.value
-    property alias cfg_claudeTokenOverride: tokenField.text
+    property alias cfg_claudeTokenFile: tokenFileField.text
 
     Kirigami.FormLayout {
         anchors.fill: parent
@@ -92,9 +92,8 @@ KCM.SimpleKCM {
             editable: true
         }
         Controls.TextField {
-            id: tokenField
-            Kirigami.FormData.label: i18n("Access token override:")
-            echoMode: TextInput.Password
+            id: tokenFileField
+            Kirigami.FormData.label: i18n("Access token file:")
             placeholderText: i18n("leave empty to use ~/.claude/.credentials.json")
             Layout.preferredWidth: Kirigami.Units.gridUnit * 16
         }
