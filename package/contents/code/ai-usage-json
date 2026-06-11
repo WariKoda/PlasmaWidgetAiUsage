@@ -173,10 +173,12 @@ CLAUDE_API_WINDOWS = [
     ("5h", "5-Hour", "five_hour"),
     ("7d", "7-Day", "seven_day"),
 ]
-CLAUDE_API_EXTRA = [
-    ("7d-opus", "7-Day Opus", "seven_day_opus"),
-    ("7d-sonnet", "7-Day Sonnet", "seven_day_sonnet"),
-]
+# Per-model 7-day sub-windows arrive as `seven_day_<tier>` keys (verified live:
+# seven_day_opus, seven_day_sonnet). We surface them data-driven from the keys the
+# API actually returns, so a newly introduced model tier shows up on its own --
+# without hard-coding (and never inventing) a key name the server has not sent.
+# `seven_day` itself lacks the trailing underscore and stays the main 7d window.
+CLAUDE_API_EXTRA_PREFIX = "seven_day_"
 
 
 def claude_from_api(data):
@@ -185,10 +187,13 @@ def claude_from_api(data):
         blk = data.get(src)
         if isinstance(blk, dict) and blk.get("utilization") is not None:
             windows.append(window(key, label, blk["utilization"], iso_to_epoch(blk.get("resets_at"))))
-    for key, label, src in CLAUDE_API_EXTRA:
+    for src in sorted(k for k in data if k.startswith(CLAUDE_API_EXTRA_PREFIX)):
         blk = data.get(src)
-        if isinstance(blk, dict) and blk.get("utilization") is not None:
-            windows.append(window(key, label, blk["utilization"], iso_to_epoch(blk.get("resets_at"))))
+        if not (isinstance(blk, dict) and blk.get("utilization") is not None):
+            continue
+        tier = src[len(CLAUDE_API_EXTRA_PREFIX):]
+        windows.append(window("7d-" + tier, "7-Day " + tier.replace("_", " ").title(),
+                              blk["utilization"], iso_to_epoch(blk.get("resets_at"))))
     return windows
 
 
