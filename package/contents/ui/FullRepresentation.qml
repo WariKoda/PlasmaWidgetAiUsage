@@ -23,7 +23,8 @@ PlasmaComponents.Page {
     Layout.preferredWidth: Kirigami.Units.gridUnit * 18
     Layout.preferredHeight: Kirigami.Units.gridUnit * 18
 
-    readonly property real colWidth: Kirigami.Units.gridUnit * 4
+    readonly property real usedColWidth: Kirigami.Units.gridUnit * 8
+    readonly property real resetColWidth: Kirigami.Units.gridUnit * 4
 
     property double nowMs: Date.now()
     Timer {
@@ -101,12 +102,12 @@ PlasmaComponents.Page {
                     }
                     PlasmaComponents.Label {
                         text: i18n("Used"); opacity: 0.6; font.bold: true
-                        Layout.preferredWidth: full.colWidth
+                        Layout.preferredWidth: full.usedColWidth
                         horizontalAlignment: Text.AlignRight
                     }
                     PlasmaComponents.Label {
                         text: i18n("Reset"); opacity: 0.6; font.bold: true
-                        Layout.preferredWidth: full.colWidth
+                        Layout.preferredWidth: full.resetColWidth
                         horizontalAlignment: Text.AlignRight
                     }
                 }
@@ -122,26 +123,47 @@ PlasmaComponents.Page {
 
                         readonly property bool hasPct: modelData.used_percent !== null
                                                        && modelData.used_percent !== undefined
+                        readonly property bool detailOnlyWindow: !modelData.resets_at
+                                                               && !!modelData.detail
 
                         PlasmaComponents.Label {
                             text: wrow.modelData.label
                             Layout.fillWidth: true
                         }
-                        PlasmaComponents.Label {
-                            text: wrow.hasPct
-                                ? Lib.fmtPct(wrow.modelData.used_percent)
-                                : (wrow.modelData.detail ? wrow.modelData.detail : "—")
-                            color: full.levelColor(Lib.levelFor(wrow.modelData.used_percent,
-                                                                full.warnThreshold, full.critThreshold))
-                            font.bold: wrow.hasPct && wrow.modelData.used_percent >= full.critThreshold
-                            Layout.preferredWidth: full.colWidth
-                            horizontalAlignment: Text.AlignRight
-                            elide: Text.ElideRight
+                        ColumnLayout {
+                            Layout.preferredWidth: wrow.detailOnlyWindow
+                                ? full.usedColWidth + full.resetColWidth + Kirigami.Units.smallSpacing
+                                : full.usedColWidth
+                            spacing: 0
+
+                            PlasmaComponents.Label {
+                                text: wrow.detailOnlyWindow
+                                    ? Lib.fmtUsage(wrow.modelData)
+                                    : (wrow.hasPct
+                                    ? Lib.fmtPct(wrow.modelData.used_percent)
+                                    : (wrow.modelData.detail ? wrow.modelData.detail : "—"))
+                                color: full.levelColor(Lib.levelFor(wrow.modelData.used_percent,
+                                                                    full.warnThreshold, full.critThreshold))
+                                font.bold: wrow.hasPct && wrow.modelData.used_percent >= full.critThreshold
+                                Layout.fillWidth: true
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideRight
+                            }
+                            PlasmaComponents.Label {
+                                visible: !wrow.detailOnlyWindow && wrow.hasPct && !!wrow.modelData.detail
+                                text: wrow.modelData.detail ? wrow.modelData.detail : ""
+                                opacity: 0.75
+                                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                                Layout.fillWidth: true
+                                horizontalAlignment: Text.AlignRight
+                                elide: Text.ElideRight
+                            }
                         }
                         PlasmaComponents.Label {
+                            visible: !wrow.detailOnlyWindow
                             text: Lib.fmtCountdown(wrow.modelData.resets_at, full.nowMs, i18n("now"))
                             opacity: 0.8
-                            Layout.preferredWidth: full.colWidth
+                            Layout.preferredWidth: full.resetColWidth
                             horizontalAlignment: Text.AlignRight
                         }
                     }

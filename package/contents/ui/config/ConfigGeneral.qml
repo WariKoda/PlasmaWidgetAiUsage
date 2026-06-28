@@ -78,7 +78,7 @@ KCM.SimpleKCM {
         }
         Controls.CheckBox {
             id: extraUsage
-            text: i18n("Show extra usage and spend")
+            text: i18n("Show extra usage")
         }
         Controls.SpinBox {
             id: cap5h

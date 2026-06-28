@@ -140,12 +140,6 @@ def format_decimal_amount(value, decimal_places=None, currency=None):
     return "%s %s" % (text, currency) if currency else text
 
 
-def format_money_obj(obj):
-    if not isinstance(obj, dict):
-        return None
-    return format_decimal_amount(obj.get("amount_minor"), obj.get("exponent"), obj.get("currency"))
-
-
 def provider(pid, label, available, source, plan, windows, error):
     return {
         "id": pid,
@@ -211,25 +205,6 @@ def claude_extra_usage_window(data):
     return None
 
 
-def claude_spend_window(data):
-    spend = data.get("spend")
-    if not isinstance(spend, dict) or spend.get("enabled") is False:
-        return None
-    used_percent = spend.get("percent")
-    used = format_money_obj(spend.get("used"))
-    limit = format_money_obj(spend.get("limit"))
-    balance = format_money_obj(spend.get("balance"))
-    if used and limit:
-        detail = "%s / %s" % (used, limit)
-    elif balance:
-        detail = "balance %s" % balance
-    else:
-        detail = None
-    if used_percent is not None or detail:
-        return window("spend", "Spend", used_percent, None, detail=detail)
-    return None
-
-
 def claude_from_api(data, show_extra_usage=False):
     windows = []
     for key, label, src in CLAUDE_API_WINDOWS:
@@ -244,9 +219,9 @@ def claude_from_api(data, show_extra_usage=False):
         windows.append(window("7d-" + tier, "7-Day " + tier.replace("_", " ").title(),
                               blk["utilization"], iso_to_epoch(blk.get("resets_at"))))
     if show_extra_usage:
-        for extra_window in (claude_extra_usage_window(data), claude_spend_window(data)):
-            if extra_window is not None:
-                windows.append(extra_window)
+        extra_window = claude_extra_usage_window(data)
+        if extra_window is not None:
+            windows.append(extra_window)
     return windows
 
 

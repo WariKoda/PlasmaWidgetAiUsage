@@ -45,6 +45,14 @@ function fmtPct(pct) {
     return Math.round(pct) + "%";
 }
 
+function fmtUsage(w) {
+    if (!w) return "—";
+    var hasPct = w.used_percent !== null && w.used_percent !== undefined;
+    if (hasPct && w.detail) return fmtPct(w.used_percent) + " · " + w.detail;
+    if (hasPct) return fmtPct(w.used_percent);
+    return w.detail ? w.detail : "—";
+}
+
 // Compact reset countdown from a unix-seconds reset timestamp, e.g. "4h44m"
 // or "6d17h". nowMs is Date.now() passed in so callers control the tick.
 // nowLabel is the already-translated "just reset" word, supplied by the caller:

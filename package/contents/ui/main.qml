@@ -31,11 +31,11 @@ PlasmoidItem {
                 var parts = [];
                 for (var j = 0; j < p.windows.length; ++j) {
                     var w = p.windows[j];
-                    var val = (w.used_percent !== null && w.used_percent !== undefined)
-                        ? Lib.fmtPct(w.used_percent)
-                        : (w.detail ? w.detail : "—");
-                    parts.push(w.label + " " + val
-                               + " (" + Lib.fmtCountdown(w.resets_at, Date.now(), i18n("now")) + ")");
+                    var val = Lib.fmtUsage(w);
+                    var reset = w.resets_at
+                        ? " (" + Lib.fmtCountdown(w.resets_at, Date.now(), i18n("now")) + ")"
+                        : "";
+                    parts.push(w.label + " " + val + reset);
                 }
                 var plan = p.plan ? " · " + p.plan : "";
                 lines.push(p.label + plan + ":\n   " + parts.join("\n   "));
