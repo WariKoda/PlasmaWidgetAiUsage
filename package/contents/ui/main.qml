@@ -69,6 +69,8 @@ PlasmoidItem {
         env.push("AI_USAGE_PROVIDERS=" + enabledProviders().join(","));
         if (!Plasmoid.configuration.claudeLocalFallback)
             env.push("AI_USAGE_CLAUDE_LOCAL_FALLBACK=0");
+        if (Plasmoid.configuration.claudeExtraUsage)
+            env.push("AI_USAGE_CLAUDE_EXTRA_USAGE=1");
         var c5 = Plasmoid.configuration.claudeCap5h;
         var c7 = Plasmoid.configuration.claudeCap7d;
         if (c5 > 0) env.push("AI_USAGE_CLAUDE_CAP_5H=" + c5);

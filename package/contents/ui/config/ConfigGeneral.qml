@@ -18,6 +18,7 @@ KCM.SimpleKCM {
     property alias cfg_showResetInCompact: showReset.checked
 
     property alias cfg_claudeLocalFallback: localFallback.checked
+    property alias cfg_claudeExtraUsage: extraUsage.checked
     property alias cfg_claudeCap5h: cap5h.value
     property alias cfg_claudeCap7d: cap7d.value
     property alias cfg_claudeTokenFile: tokenFileField.text
@@ -74,6 +75,10 @@ KCM.SimpleKCM {
             id: localFallback
             Kirigami.FormData.label: i18n("Claude:")
             text: i18n("Local token estimate when the API is unavailable")
+        }
+        Controls.CheckBox {
+            id: extraUsage
+            text: i18n("Show extra usage and spend")
         }
         Controls.SpinBox {
             id: cap5h

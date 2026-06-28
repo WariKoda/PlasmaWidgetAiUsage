@@ -129,6 +129,23 @@ def window(key, label, used_percent, resets_at, detail=None):
     return win
 
 
+def format_decimal_amount(value, decimal_places=None, currency=None):
+    if not isinstance(value, (int, float)):
+        return None
+    if isinstance(decimal_places, int) and decimal_places > 0:
+        amount = value / (10 ** decimal_places)
+        text = ("%%.%df" % decimal_places) % amount
+    else:
+        text = str(int(value)) if float(value).is_integer() else ("%.2f" % value).rstrip("0").rstrip(".")
+    return "%s %s" % (text, currency) if currency else text
+
+
+def format_money_obj(obj):
+    if not isinstance(obj, dict):
+        return None
+    return format_decimal_amount(obj.get("amount_minor"), obj.get("exponent"), obj.get("currency"))
+
+
 def provider(pid, label, available, source, plan, windows, error):
     return {
         "id": pid,
@@ -181,7 +198,39 @@ CLAUDE_API_WINDOWS = [
 CLAUDE_API_EXTRA_PREFIX = "seven_day_"
 
 
-def claude_from_api(data):
+def claude_extra_usage_window(data):
+    extra = data.get("extra_usage")
+    if not isinstance(extra, dict) or extra.get("is_enabled") is False:
+        return None
+    used_percent = extra.get("utilization")
+    used = format_decimal_amount(extra.get("used_credits"), extra.get("decimal_places"), extra.get("currency"))
+    limit = format_decimal_amount(extra.get("monthly_limit"), extra.get("decimal_places"), extra.get("currency"))
+    detail = "%s / %s" % (used, limit) if used and limit else None
+    if used_percent is not None or detail:
+        return window("extra-usage", "Extra Usage", used_percent, None, detail=detail)
+    return None
+
+
+def claude_spend_window(data):
+    spend = data.get("spend")
+    if not isinstance(spend, dict) or spend.get("enabled") is False:
+        return None
+    used_percent = spend.get("percent")
+    used = format_money_obj(spend.get("used"))
+    limit = format_money_obj(spend.get("limit"))
+    balance = format_money_obj(spend.get("balance"))
+    if used and limit:
+        detail = "%s / %s" % (used, limit)
+    elif balance:
+        detail = "balance %s" % balance
+    else:
+        detail = None
+    if used_percent is not None or detail:
+        return window("spend", "Spend", used_percent, None, detail=detail)
+    return None
+
+
+def claude_from_api(data, show_extra_usage=False):
     windows = []
     for key, label, src in CLAUDE_API_WINDOWS:
         blk = data.get(src)
@@ -194,6 +243,10 @@ def claude_from_api(data):
         tier = src[len(CLAUDE_API_EXTRA_PREFIX):]
         windows.append(window("7d-" + tier, "7-Day " + tier.replace("_", " ").title(),
                               blk["utilization"], iso_to_epoch(blk.get("resets_at"))))
+    if show_extra_usage:
+        for extra_window in (claude_extra_usage_window(data), claude_spend_window(data)):
+            if extra_window is not None:
+                windows.append(extra_window)
     return windows
 
 
@@ -332,7 +385,7 @@ def provider_claude(cfg):
     retry_until = cache.get("retry_after_until", 0)
 
     def from_cache(data, stale):
-        windows = claude_from_api(data)
+        windows = claude_from_api(data, cfg["claude_extra_usage"])
         if not windows:
             return None
         if not stale:
@@ -630,6 +683,7 @@ def load_config():
         "claude_token": env_str("AI_USAGE_CLAUDE_TOKEN"),
         "claude_token_file": env_str("AI_USAGE_CLAUDE_TOKEN_FILE"),
         "claude_local_fallback": env_bool("AI_USAGE_CLAUDE_LOCAL_FALLBACK", True),
+        "claude_extra_usage": env_bool("AI_USAGE_CLAUDE_EXTRA_USAGE", False),
         "claude_cap_5h": env_int("AI_USAGE_CLAUDE_CAP_5H"),
         "claude_cap_7d": env_int("AI_USAGE_CLAUDE_CAP_7D"),
     }
