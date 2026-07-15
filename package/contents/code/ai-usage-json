@@ -425,13 +425,20 @@ def provider_claude(cfg):
 #   {"type": "event_msg", "timestamp": "...", "payload": {
 #       "type": "token_count",
 #       "rate_limits": {
-#           "primary":   {"used_percent": 9.0, "window_minutes": 300,   "resets_at": 1776855643},
-#           "secondary": {"used_percent": 1.0, "window_minutes": 10080, "resets_at": 1777442443},
+#           "primary": {"used_percent": 13.0, "window_minutes": 10080, "resets_at": 1784694734},
 #           "plan_type": "plus", ...}}}
-CODEX_WINDOWS = [
-    ("5h", "5-Hour", "primary"),
-    ("7d", "7-Day", "secondary"),
-]
+def codex_window_identity(slot, window_minutes):
+    """Return a stable key and readable label for a server-reported window."""
+    fallback = (slot, slot.title())
+    if isinstance(window_minutes, bool) or not isinstance(window_minutes, int) or window_minutes <= 0:
+        return fallback
+    if window_minutes % (24 * 60) == 0:
+        amount = window_minutes // (24 * 60)
+        return "%dd" % amount, "%d-Day" % amount
+    if window_minutes % 60 == 0:
+        amount = window_minutes // 60
+        return "%dh" % amount, "%d-Hour" % amount
+    return "%dm" % window_minutes, "%d-Minute" % window_minutes
 
 
 def codex_extract_rate_limits(obj):
@@ -487,13 +494,14 @@ def provider_codex(cfg):
                         "no rate-limit data found in ~/.codex/sessions")
     plan = rate_limits.get("plan_type")
     windows = []
-    for key, label, src in CODEX_WINDOWS:
-        blk = rate_limits.get(src)
+    for slot in ("primary", "secondary"):
+        blk = rate_limits.get(slot)
         if isinstance(blk, dict) and blk.get("used_percent") is not None:
+            key, label = codex_window_identity(slot, blk.get("window_minutes"))
             windows.append(window(key, label, blk["used_percent"], blk.get("resets_at")))
     if not windows:
         return provider("codex", "Codex", False, None, plan, [],
-                        "rate-limit payload present but no primary/secondary windows")
+                        "rate-limit payload present but no usable primary/secondary windows")
     return provider("codex", "Codex", True, "local-session", plan, windows, None)
 
 

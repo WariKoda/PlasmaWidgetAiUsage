@@ -26,7 +26,7 @@ never a fabricated `0 %`.
 | Provider | Primary source | Real % ? | Notes |
 |----------|----------------|:--------:|-------|
 | **Claude** | `GET https://api.anthropic.com/api/oauth/usage` (Bearer token from `~/.claude/.credentials.json`) | ✅ | Matches the utilization shown on claude.ai. Optional local token-estimate fallback when the API/token is unavailable. |
-| **Codex** | Newest `~/.codex/sessions/**/rollout-*.jsonl`, last `token_count` event (`payload.rate_limits.primary` / `.secondary`) | ✅ | Purely local — no network. Values come straight from what the Codex server last reported to the CLI. |
+| **Codex** | Newest `~/.codex/sessions/**/rollout-*.jsonl`, last `token_count` event (`payload.rate_limits.primary` / `.secondary`) | ✅ | Purely local — no network. Values and window durations come straight from what the Codex server last reported to the CLI (`window_minutes`). |
 | **Antigravity** | Local `agy` language-server `getUserStatus` Connect RPC — per-model `quotaInfo.remainingFraction` + prompt credits | ✅ | The real signed-in quota the IDE shows, read over loopback (no internet). Its server runs only while Antigravity is open; once closed the tile shows the last-known values marked *cached (stale)*, or *unavailable* if it was never reached. |
 
 The Claude OAuth usage endpoint is internal/undocumented; the exact response
