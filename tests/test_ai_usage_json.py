@@ -1,3 +1,4 @@
+import json
 import runpy
 import unittest
 from pathlib import Path
@@ -6,6 +7,14 @@ from unittest import mock
 
 HELPER = Path(__file__).parents[1] / "package/contents/code/ai-usage-json"
 MODULE = runpy.run_path(str(HELPER), run_name="ai_usage_json_test")
+
+
+class MetadataVersionTests(unittest.TestCase):
+    def test_package_version_matches_release(self):
+        metadata_path = Path(__file__).parents[1] / "package/metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(metadata["KPlugin"]["Version"], "0.1.3")
 
 
 class CodexWindowIdentityTests(unittest.TestCase):
