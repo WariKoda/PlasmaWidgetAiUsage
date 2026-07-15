@@ -9,6 +9,7 @@ __pycache__/
 # Build artefacts
 *.plasmoid
 screenshots/
+.worktrees/
 
 # Claude Code — personal, not shared
 CLAUDE.local.md
