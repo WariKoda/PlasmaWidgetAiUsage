@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-KDE **Plasma 6 / Qt 6 / KF6** panel widget (`org.warikoda.aiusage`) showing AI coding-assistant usage (Claude / Codex / Gemini) as 5-hour and 7-day windows.
+KDE **Plasma 6 / Qt 6 / KF6** panel widget (`org.warikoda.aiusage`) showing AI coding-assistant usage (Claude / Codex / Gemini) in each provider's real reported limit windows.
 
 ## Architecture (do not break this split)
 
