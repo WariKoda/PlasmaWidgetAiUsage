@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Cache Claude statusline rate limits and preserve the previous statusline."""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+
+CACHE_DIR = os.path.expanduser("~/.cache/plasma-ai-usage")
+CACHE_PATH = os.path.join(CACHE_DIR, "claude-statusline.json")
+MAX_RESET_TIMESTAMP = 253_402_300_799
+
+
+def valid_number(value, minimum, maximum):
+    return (not isinstance(value, bool) and isinstance(value, (int, float)) and
+            (not isinstance(value, float) or math.isfinite(value)) and
+            minimum <= value <= maximum)
+
+
+def normalized_rate_limits(payload):
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, dict):
+        return None
+    result = {}
+    for name in ("five_hour", "seven_day"):
+        block = rate_limits.get(name)
+        percentage = block.get("used_percentage") if isinstance(block, dict) else None
+        resets_at = block.get("resets_at") if isinstance(block, dict) else None
+        if (valid_number(percentage, 0, 100) and
+                (resets_at is None or valid_number(resets_at, 0, MAX_RESET_TIMESTAMP))):
+            result[name] = {
+                "used_percentage": percentage,
+                "resets_at": resets_at,
+            }
+    return result or None
+
+
+def write_cache(rate_limits):
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(CACHE_DIR, 0o700)
+    fd, temp_path = tempfile.mkstemp(prefix=".claude-statusline-", dir=CACHE_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump({"fetched_at": int(time.time()), "rate_limits": rate_limits}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, CACHE_PATH)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def cache_payload(raw):
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    rate_limits = normalized_rate_limits(payload)
+    if rate_limits is None:
+        return
+    try:
+        write_cache(rate_limits)
+    except OSError:
+        pass
+
+
+def main():
+    raw = sys.stdin.read()
+    cache_payload(raw)
+
+    command = os.environ.get("AI_USAGE_PREVIOUS_STATUSLINE")
+    if not command:
+        return 0
+    return subprocess.run(command, shell=True, input=raw, text=True, check=False).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
