@@ -22,6 +22,11 @@ class RepositoryBranchPolicyTests(unittest.TestCase):
     def test_readme_documents_one_way_maintenance_policy(self):
         source = README.read_text(encoding="utf-8")
 
+        self.assertIn(
+            "[Plasma 5.27 compatibility branch]"
+            "(https://github.com/WariKoda/PlasmaWidgetAiUsage/tree/plasma-5.27)",
+            source,
+        )
         self.assertIn("## Maintenance branches", source)
         self.assertIn("`main` → `plasma-5.27`", source)
         self.assertIn("must never be merged back into `main`", source)
