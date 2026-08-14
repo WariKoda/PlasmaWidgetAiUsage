@@ -11,6 +11,21 @@ KCM.SimpleKCM {
     // cfg_<name> properties are auto-bound to matching main.xml entries.
     property string cfg_claudeProfilesJson: "{\"manual\":[],\"overrides\":{}}"
 
+    // Plasma also initializes cfg_<name>Default for every KConfig entry.
+    property bool cfg_showClaudeDefault: true
+    property bool cfg_showCodexDefault: true
+    property bool cfg_showAntigravityDefault: true
+    property int cfg_refreshIntervalSecDefault: 120
+    property int cfg_warnThresholdDefault: 75
+    property int cfg_critThresholdDefault: 90
+    property bool cfg_showResetInCompactDefault: true
+    property bool cfg_claudeLocalFallbackDefault: true
+    property bool cfg_claudeExtraUsageDefault: false
+    property string cfg_claudeProfilesJsonDefault: "{\"manual\":[],\"overrides\":{}}"
+    property int cfg_claudeCap5hDefault: 0
+    property int cfg_claudeCap7dDefault: 0
+    property string cfg_claudeTokenFileDefault: ""
+
     property var discoveredProfiles: []
     property string discoveryError: ""
     property bool discoveryBusy: false

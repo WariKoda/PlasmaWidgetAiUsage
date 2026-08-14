@@ -1,3 +1,4 @@
+import json
 import re
 import unittest
 import xml.etree.ElementTree as ElementTree
@@ -36,6 +37,28 @@ class ClaudeProfileConfigurationContractTests(unittest.TestCase):
             entry.findtext("kcfg:default", namespaces=namespace),
             '{"manual":[],"overrides":{}}',
         )
+
+    def test_settings_declares_every_kconfig_default_property(self):
+        root = ElementTree.parse(MAIN_XML).getroot()
+        namespace = {"kcfg": "http://www.kde.org/standards/kcfg/1.0"}
+        qml_source = CONFIG_GENERAL.read_text(encoding="utf-8")
+        qml_types = {"Bool": "bool", "Int": "int", "String": "string"}
+
+        for entry in root.findall(".//kcfg:entry", namespace):
+            name = entry.attrib["name"]
+            kconfig_type = entry.attrib["type"]
+            default = entry.findtext("kcfg:default", default="", namespaces=namespace)
+            if kconfig_type == "Bool":
+                qml_default = default.lower()
+            elif kconfig_type == "Int":
+                qml_default = default
+            else:
+                qml_default = json.dumps(default)
+            declaration = (
+                f"property {qml_types[kconfig_type]} "
+                f"cfg_{name}Default: {qml_default}"
+            )
+            self.assertIn(declaration, qml_source, declaration)
 
     def test_profile_editor_exposes_the_configuration_contract(self):
         source = compact_qml(PROFILE_EDITOR)
@@ -160,6 +183,20 @@ class ClaudeProfileConfigurationContractTests(unittest.TestCase):
             "? section.modelData.base_provider : section.modelData.id",
             full,
         )
+
+    def test_full_representation_keeps_refresh_outside_scroll_area(self):
+        source = compact_qml(FULL_REPRESENTATION)
+
+        self.assertIn("PlasmaComponents.ScrollView", source)
+        scroll_view = source.index("PlasmaComponents.ScrollView")
+        provider_repeater = source.index("Repeater { model: full.providers", scroll_view)
+        separator = source.index("Kirigami.Separator", provider_repeater)
+        refresh_button = source.index('text: i18n("Refresh")', separator)
+
+        self.assertLess(scroll_view, provider_repeater)
+        self.assertLess(provider_repeater, separator)
+        self.assertLess(separator, refresh_button)
+        self.assertIn("Layout.fillHeight: true", source[scroll_view:provider_repeater])
 
 
 if __name__ == "__main__":
