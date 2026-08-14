@@ -156,6 +156,13 @@ errors are deliberately limited and never expose raw settings or credentials.
 
 Version `0.2.0`. Built and verified on Plasma 6.6.5 / Qt 6.10.
 
+## Maintenance branches
+
+`main` is the Plasma 6 development line. `plasma-5.27` is a separate,
+long-lived compatibility branch. Shared fixes may flow in one direction only:
+`main` → `plasma-5.27`. The branch must never be merged back into `main`. A
+required repository check enforces this direction for pull requests.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
