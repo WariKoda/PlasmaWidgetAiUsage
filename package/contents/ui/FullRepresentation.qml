@@ -70,6 +70,8 @@ PlasmaComponents.Page {
                         implicitWidth: Kirigami.Units.iconSizes.smallMedium
                         implicitHeight: implicitWidth
                         providerId: section.modelData.id
+                        baseProvider: section.modelData.base_provider
+                            ? section.modelData.base_provider : section.modelData.id
                         dimmed: !section.modelData.available
                         Layout.alignment: Qt.AlignVCenter
                     }

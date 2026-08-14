@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cache Claude statusline rate limits and preserve the previous statusline."""
 
+import hashlib
 import json
 import math
 import os
@@ -11,8 +12,21 @@ import time
 
 
 CACHE_DIR = os.path.expanduser("~/.cache/plasma-ai-usage")
-CACHE_PATH = os.path.join(CACHE_DIR, "claude-statusline.json")
 MAX_RESET_TIMESTAMP = 253_402_300_799
+
+
+def active_profile_dir(environ=None, home=None):
+    environ = os.environ if environ is None else environ
+    home = os.path.expanduser("~") if home is None else home
+    configured = environ.get("CLAUDE_CONFIG_DIR")
+    path = configured if configured else os.path.join(home, ".claude")
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def profile_cache_path(profile_dir):
+    canonical = os.path.realpath(profile_dir)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(CACHE_DIR, "claude-statusline-%s.json" % digest)
 
 
 def valid_number(value, minimum, maximum):
@@ -39,10 +53,11 @@ def normalized_rate_limits(payload):
     return result or None
 
 
-def write_cache(rate_limits):
-    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-    os.chmod(CACHE_DIR, 0o700)
-    fd, temp_path = tempfile.mkstemp(prefix=".claude-statusline-", dir=CACHE_DIR)
+def write_cache(rate_limits, cache_path):
+    cache_dir = os.path.dirname(cache_path)
+    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+    os.chmod(cache_dir, 0o700)
+    fd, temp_path = tempfile.mkstemp(prefix=".claude-statusline-", dir=cache_dir)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -50,7 +65,7 @@ def write_cache(rate_limits):
             json.dump({"fetched_at": int(time.time()), "rate_limits": rate_limits}, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, CACHE_PATH)
+        os.replace(temp_path, cache_path)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -60,7 +75,7 @@ def write_cache(rate_limits):
             pass
 
 
-def cache_payload(raw):
+def cache_payload(raw, cache_path):
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
@@ -71,19 +86,25 @@ def cache_payload(raw):
     if rate_limits is None:
         return
     try:
-        write_cache(rate_limits)
+        write_cache(rate_limits, cache_path)
     except OSError:
         pass
 
 
 def main():
     raw = sys.stdin.read()
-    cache_payload(raw)
+    cache_path = profile_cache_path(active_profile_dir())
+    cache_payload(raw, cache_path)
 
     command = os.environ.get("AI_USAGE_PREVIOUS_STATUSLINE")
     if not command:
         return 0
-    return subprocess.run(command, shell=True, input=raw, text=True, check=False).returncode
+    previous_env = os.environ.copy()
+    previous_env.pop("AI_USAGE_PREVIOUS_STATUSLINE", None)
+    return subprocess.run(
+        command, shell=True, input=raw, text=True, check=False,
+        env=previous_env,
+    ).returncode
 
 
 if __name__ == "__main__":

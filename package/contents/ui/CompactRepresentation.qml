@@ -72,6 +72,8 @@ Item {
                     implicitWidth: Kirigami.Units.iconSizes.small * 0.9
                     implicitHeight: implicitWidth
                     providerId: chip.modelData.id
+                    baseProvider: chip.modelData.base_provider
+                        ? chip.modelData.base_provider : chip.modelData.id
                     dimmed: !chip.modelData.available
                 }
 

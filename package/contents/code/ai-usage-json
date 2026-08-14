@@ -46,8 +46,11 @@ from __future__ import annotations
 
 import glob
 import fcntl
+import hashlib
 import json
 import math
+import multiprocessing
+import multiprocessing.connection
 import os
 import re
 import selectors
@@ -61,10 +64,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-CLAUDE_CREDENTIALS = os.path.expanduser("~/.claude/.credentials.json")
-CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-
 CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 CODEX_APP_SERVER_COMMAND = ["codex", "app-server", "--stdio"]
 CODEX_SESSION_MAX_AGE = 900
@@ -82,8 +82,8 @@ HTTP_TIMEOUT = 10
 # stale) instead of dropping to a null estimate.
 CACHE_DIR = os.path.expanduser("~/.cache/plasma-ai-usage")
 CLAUDE_CACHE = os.path.join(CACHE_DIR, "claude-usage.json")
-CLAUDE_OAUTH_LOCK = os.path.join(CACHE_DIR, "claude-oauth.lock")
 CLAUDE_OAUTH_LOCK_TIMEOUT = 0.5
+CLAUDE_INTEGRATION_LOCK_TIMEOUT = 0.5
 CLAUDE_STATUSLINE_CACHE = os.path.join(CACHE_DIR, "claude-statusline.json")
 CLAUDE_INTEGRATION_STATE = os.path.join(CACHE_DIR, "claude-integration.json")
 CLAUDE_SETTINGS = os.path.expanduser("~/.claude/settings.json")
@@ -94,6 +94,9 @@ CLAUDE_OAUTH_MAX_AGE = 3600
 CLAUDE_MINIMUM_VERSION = (2, 1, 80)
 CLAUDE_MAX_RESET_TIMESTAMP = 253_402_300_799  # 9999-12-31T23:59:59Z
 MAX_SAFE_EXTERNAL_NUMBER = 1_000_000_000_000_000
+HELPER_TOTAL_DEADLINE_SECONDS = 15.0
+CLAUDE_PROFILE_MAX_WORKERS = 4
+CLAUDE_PROFILE_CLEANUP_TIMEOUT = 0.2
 
 
 # --------------------------------------------------------------------------- #
@@ -121,12 +124,156 @@ def env_bool(name: str, default: bool) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def claude_profile_id(path: str) -> str:
+    digest = hashlib.sha256(os.path.realpath(path).encode("utf-8")).hexdigest()[:12]
+    return "claude-" + digest
+
+
+def default_claude_profile_label(path, home):
+    name = os.path.basename(path)
+    if os.path.realpath(path) == os.path.realpath(os.path.join(home, ".claude")):
+        return "Claude"
+    suffix = name[len(".claude-"):] if name.startswith(".claude-") else name
+    words = re.split(r"[-_]+", suffix)
+    return "Claude " + " ".join(word.capitalize() for word in words if word)
+
+
+def has_claude_profile_marker(canonical_path):
+    """Recognize profile markers only when each marker has its required type."""
+    return (os.path.isfile(os.path.join(canonical_path, ".credentials.json")) or
+            os.path.isfile(os.path.join(canonical_path, "settings.json")) or
+            os.path.isdir(os.path.join(canonical_path, "projects")))
+
+
+def validate_claude_profiles_config(raw_config: object):
+    if not isinstance(raw_config, dict):
+        raise ValueError("Claude profile configuration must be an object")
+    unknown_keys = set(raw_config) - {"manual", "overrides"}
+    if unknown_keys:
+        raise ValueError("unknown Claude profile configuration key: %s" % sorted(unknown_keys)[0])
+
+    manual = raw_config.get("manual", [])
+    overrides = raw_config.get("overrides", {})
+    if not isinstance(manual, list):
+        raise ValueError("Claude profile configuration manual must be a list")
+    if not isinstance(overrides, dict):
+        raise ValueError("Claude profile configuration overrides must be an object")
+
+    for index, entry in enumerate(manual):
+        if not isinstance(entry, dict):
+            raise ValueError("Claude profile manual entry %d must be an object" % index)
+        if set(entry) != {"path"} or not isinstance(entry["path"], str) or not entry["path"].strip():
+            raise ValueError("Claude profile manual entry %d must contain a non-empty path" % index)
+
+    for path, override in overrides.items():
+        if not isinstance(path, str) or not path:
+            raise ValueError("Claude profile override path must be a non-empty string")
+        if not isinstance(override, dict):
+            raise ValueError("Claude profile override for %s must be an object" % path)
+        unknown_override_keys = set(override) - {"label", "enabled"}
+        if unknown_override_keys:
+            raise ValueError("unknown Claude profile override key for %s: %s" % (
+                path, sorted(unknown_override_keys)[0]))
+        if "label" in override:
+            if not isinstance(override["label"], str) or not override["label"].strip():
+                raise ValueError("Claude profile override label for %s must be a non-empty string" % path)
+        if "enabled" in override and not isinstance(override["enabled"], bool):
+            raise ValueError("Claude profile override enabled for %s must be a boolean" % path)
+
+
+def discover_claude_profiles(raw_config: object, home: str | None = None) -> list[dict]:
+    validate_claude_profiles_config(raw_config)
+    manual = raw_config.get("manual", [])
+    overrides = {
+        os.path.realpath(os.path.abspath(os.path.expanduser(path))): override
+        for path, override in raw_config.get("overrides", {}).items()
+    }
+    home = os.path.realpath(os.path.abspath(os.path.expanduser(home or "~")))
+
+    automatic = {}
+    candidates = [os.path.join(home, ".claude")]
+    candidates.extend(sorted(glob.glob(os.path.join(home, ".claude-*"))))
+    for path in candidates:
+        canonical_path = os.path.realpath(path)
+        if not os.path.isdir(canonical_path):
+            continue
+        if not has_claude_profile_marker(canonical_path):
+            continue
+        automatic[canonical_path] = {
+            "id": claude_profile_id(canonical_path),
+            "base_provider": "claude",
+            "label": default_claude_profile_label(path, home),
+            "path": path,
+            "canonical_path": canonical_path,
+            "automatic": True,
+            "enabled": True,
+            "manual_paths": [],
+        }
+
+    manual_only = {}
+    manual_order = []
+    for entry in manual:
+        raw_path = entry["path"]
+        path = os.path.abspath(os.path.expanduser(raw_path))
+        canonical_path = os.path.realpath(path)
+        if canonical_path in automatic:
+            automatic[canonical_path]["manual_paths"].append(raw_path)
+            continue
+        if canonical_path in manual_only:
+            manual_only[canonical_path]["manual_paths"].append(raw_path)
+            continue
+
+        profile = {
+            "id": claude_profile_id(canonical_path),
+            "base_provider": "claude",
+            "label": default_claude_profile_label(path, home),
+            "path": path,
+            "canonical_path": canonical_path,
+            "automatic": False,
+            "enabled": True,
+            "manual_paths": [raw_path],
+        }
+        if not os.path.exists(canonical_path):
+            profile["profile_error"] = "profile directory does not exist"
+        elif not os.path.isdir(canonical_path):
+            profile["profile_error"] = "profile path is not a directory"
+        elif not has_claude_profile_marker(canonical_path):
+            profile["profile_error"] = "profile marker not found"
+        manual_only[canonical_path] = profile
+        manual_order.append(canonical_path)
+
+    profiles = [automatic[path] for path in sorted(automatic)]
+    profiles.extend(manual_only[path] for path in manual_order)
+    for profile in profiles:
+        override = overrides.get(profile["canonical_path"])
+        if override is None:
+            continue
+        if "label" in override:
+            profile["label"] = override["label"].strip()
+        if "enabled" in override:
+            profile["enabled"] = override["enabled"]
+    return profiles
+
+
 def read_json(path: str):
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return None
+
+
+def read_json_state(path: str, label="JSON file"):
+    """Return (missing|valid|invalid|unreadable, value, explicit error)."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return "valid", json.load(handle), None
+    except FileNotFoundError:
+        return "missing", None, None
+    except (ValueError, UnicodeError) as exc:
+        return "invalid", None, "%s is malformed: %s" % (label, exc)
+    except OSError as exc:
+        return "unreadable", None, "%s is unreadable: %s" % (label, exc)
 
 
 def atomic_write_json(path, obj, destination_dir):
@@ -136,6 +283,54 @@ def atomic_write_json(path, obj, destination_dir):
     fd, temp_path = tempfile.mkstemp(prefix=".ai-usage-", dir=destination_dir)
     try:
         os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(obj, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_create_json(path, obj, destination_dir):
+    """Atomically publish private JSON only when path does not already exist."""
+    os.makedirs(destination_dir, mode=0o700, exist_ok=True)
+    os.chmod(destination_dir, 0o700)
+    fd, temp_path = tempfile.mkstemp(prefix=".ai-usage-", dir=destination_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(obj, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_settings_json(path, obj):
+    """Atomically update a canonical settings target without changing its modes."""
+    destination_dir = os.path.dirname(path)
+    existing_mode = os.stat(path).st_mode & 0o7777
+    fd, temp_path = tempfile.mkstemp(prefix=".ai-usage-settings-", dir=destination_dir)
+    try:
+        os.fchmod(fd, existing_mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             json.dump(obj, handle)
@@ -202,8 +397,8 @@ def format_decimal_amount(value, decimal_places=None, currency=None):
     return "%s %s" % (text, currency) if currency else text
 
 
-def provider(pid, label, available, source, plan, windows, error):
-    return {
+def provider(pid, label, available, source, plan, windows, error, base_provider=None):
+    result = {
         "id": pid,
         "label": label,
         "available": available,
@@ -212,6 +407,9 @@ def provider(pid, label, available, source, plan, windows, error):
         "windows": windows,
         "error": error,
     }
+    if base_provider is not None:
+        result["base_provider"] = base_provider
+    return result
 
 
 def http_get_json(url, token, timeout=HTTP_TIMEOUT):
@@ -272,17 +470,258 @@ def claude_version_tuple(version_output):
 
 def managed_claude_command(previous_statusline):
     previous_command = previous_statusline.get("command") if isinstance(previous_statusline, dict) else None
-    collector = shlex.quote(os.path.abspath(CLAUDE_COLLECTOR))
+    parts = []
     if isinstance(previous_command, str) and previous_command:
-        return "AI_USAGE_PREVIOUS_STATUSLINE=%s %s" % (shlex.quote(previous_command), collector)
-    return collector
+        parts.append("AI_USAGE_PREVIOUS_STATUSLINE=" + shlex.quote(previous_command))
+    parts.append(shlex.quote(os.path.abspath(CLAUDE_COLLECTOR)))
+    return " ".join(parts)
 
 
-def claude_integration_status():
-    """Return the public state/message/version/can_setup management object."""
+def claude_integration_state_path(settings_path: str) -> str:
+    settings_realpath = os.path.realpath(settings_path)
+    suffix = hashlib.sha256(settings_realpath.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(CACHE_DIR, "claude-integration-%s.json" % suffix)
+
+
+def claude_integration_lock_path(settings_path: str) -> str:
+    settings_realpath = os.path.realpath(settings_path)
+    suffix = hashlib.sha256(settings_realpath.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(CACHE_DIR, "claude-integration-%s.lock" % suffix)
+
+
+def path_identity(path):
+    try:
+        stat_result = os.lstat(path)
+        link_target = os.readlink(path) if os.path.islink(path) else None
+        return (stat_result.st_dev, stat_result.st_ino, stat_result.st_mode,
+                link_target)
+    except OSError:
+        return None
+
+
+def file_identity(path):
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+            stat_result = os.fstat(handle.fileno())
+        return (stat_result.st_dev, stat_result.st_ino, stat_result.st_mtime_ns,
+                stat_result.st_size, data)
+    except OSError:
+        return None
+
+
+def claude_settings_alias_is_stable(paths):
+    if os.path.realpath(paths["settings_alias"]) != paths["settings_realpath"]:
+        return False
+    return (not paths["settings_alias_is_symlink"] or
+            path_identity(paths["settings_alias"]) == paths["settings_alias_identity"])
+
+
+def claude_acquire_integration_lock(paths):
+    fd = None
+    try:
+        lock_path = paths["integration_lock"]
+        lock_dir = os.path.dirname(lock_path)
+        os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+        os.chmod(lock_dir, 0o700)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + CLAUDE_INTEGRATION_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd, None
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return None, "Claude integration lock timed out"
+                time.sleep(0.01)
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        return None, "Claude integration lock failed: %s" % exc
+
+
+def valid_claude_integration_state(state_data, settings_realpath):
+    if not isinstance(state_data, dict):
+        return False
+    recorded_path = state_data.get("settings_realpath")
+    managed_command = state_data.get("managed_command")
+    previous_present = state_data.get("previous_statusline_present")
+    if (not isinstance(recorded_path, str) or not recorded_path or
+            recorded_path != settings_realpath or
+            not isinstance(managed_command, str) or not managed_command.strip() or
+            type(previous_present) is not bool or
+            "previous_statusline" not in state_data):
+        return False
+    previous = state_data["previous_statusline"]
+    if previous_present:
+        if previous is not None and not isinstance(previous, dict):
+            return False
+        previous_command = previous.get("command") if isinstance(previous, dict) else None
+        if isinstance(previous_command, str) and previous_command:
+            invokes_collector = claude_command_is_own_collector_wrapper(
+                previous_command)
+            if invokes_collector is not False:
+                return False
+        return True
+    return previous is None
+
+
+def claude_settings_match_managed_state(settings, state_data):
+    current = settings.get("statusLine")
+    current_command = current.get("command") if isinstance(current, dict) else None
+    return current_command == state_data["managed_command"]
+
+
+def claude_settings_match_restored_state(settings, state_data):
+    if state_data["previous_statusline_present"]:
+        return ("statusLine" in settings and
+                settings["statusLine"] == state_data["previous_statusline"])
+    return "statusLine" not in settings
+
+
+def claude_command_is_own_collector_wrapper(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+
+    assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+    index = 0
+    while index < len(parts) and assignment.match(parts[index]):
+        index += 1
+
+    if index < len(parts) and os.path.basename(parts[index]) == "env":
+        index += 1
+        options_with_value = {
+            "-u", "--unset", "-C", "--chdir", "-a", "--argv0",
+        }
+        options_without_value = {
+            "-", "-i", "--ignore-environment", "-0", "--null", "--debug",
+        }
+        while index < len(parts):
+            part = parts[index]
+            if part == "--":
+                index += 1
+                break
+            if part in options_without_value:
+                index += 1
+                continue
+            if part in options_with_value:
+                if index + 1 >= len(parts):
+                    return None
+                index += 2
+                continue
+            if part in ("-S", "--split-string") or part.startswith(
+                    ("-S", "--split-string=")):
+                return None
+            if part.startswith(("--unset=", "--chdir=", "--argv0=")):
+                index += 1
+                continue
+            if (part.startswith(("-u", "-C", "-a")) and
+                    len(part) > 2):
+                index += 1
+                continue
+            if part.startswith("-"):
+                return None
+            break
+        while index < len(parts) and "=" in parts[index]:
+            index += 1
+
+    if index >= len(parts):
+        return False
+    collector = os.path.realpath(os.path.abspath(CLAUDE_COLLECTOR))
+    command_path = os.path.realpath(os.path.abspath(
+        os.path.expanduser(parts[index])))
+    return command_path == collector
+
+
+def claude_integration_paths(profile_dir):
+    if not isinstance(profile_dir, str) or not profile_dir.strip():
+        return None, "Claude profile path must be a non-empty directory path"
+    canonical_path = os.path.realpath(
+        os.path.abspath(os.path.expanduser(profile_dir)))
+    if not os.path.exists(canonical_path):
+        return None, "Claude profile directory does not exist"
+    if not os.path.isdir(canonical_path):
+        return None, "Claude profile path is not a directory"
+    profile = {
+        "id": claude_profile_id(canonical_path),
+        "canonical_path": canonical_path,
+    }
+    paths = claude_profile_paths(profile)
+    settings_alias = paths["settings"]
+    paths["profile"] = canonical_path
+    paths["settings_alias"] = settings_alias
+    paths["settings_alias_is_symlink"] = os.path.islink(settings_alias)
+    paths["settings_alias_identity"] = path_identity(settings_alias)
+    paths["settings_realpath"] = os.path.realpath(settings_alias)
+    paths["settings"] = paths["settings_realpath"]
+    paths["integration_state"] = claude_integration_state_path(
+        paths["settings_realpath"])
+    paths["integration_lock"] = claude_integration_lock_path(
+        paths["settings_realpath"])
+    if not claude_settings_alias_is_stable(paths):
+        return None, "Claude settings path changed while resolving it"
+    return paths, None
+
+
+def claude_load_integration_state(paths, settings):
+    state_path = paths["integration_state"]
+    state_status, state_data, state_read_error = read_json_state(
+        state_path, "Claude integration state")
+    if state_status != "missing":
+        if state_status != "valid":
+            return None, state_read_error
+        if not valid_claude_integration_state(
+                state_data, paths["settings_realpath"]):
+            return None, "Claude integration state is invalid"
+        return state_data, None
+
+    default_profile = os.path.realpath(os.path.dirname(CLAUDE_SETTINGS))
+    if paths["profile"] != default_profile or not os.path.exists(CLAUDE_INTEGRATION_STATE):
+        return None, None
+
+    legacy_status, legacy_state, legacy_read_error = read_json_state(
+        CLAUDE_INTEGRATION_STATE, "Legacy Claude integration state")
+    if legacy_status != "valid":
+        return None, legacy_read_error or "Legacy Claude integration state is invalid"
+    recorded_path = legacy_state.get("settings_realpath")
+    if recorded_path not in (None, paths["settings_realpath"]):
+        return None, "Legacy Claude integration state is invalid"
+    migrated_state = dict(legacy_state)
+    migrated_state["settings_realpath"] = paths["settings_realpath"]
+    if not valid_claude_integration_state(
+            migrated_state, paths["settings_realpath"]):
+        return None, "Legacy Claude integration state is invalid"
+    if not (claude_settings_match_managed_state(settings, migrated_state) or
+            claude_settings_match_restored_state(settings, migrated_state)):
+        return None, "Legacy Claude integration state does not match current settings"
+
+    try:
+        created = atomic_create_json(
+            state_path, migrated_state, os.path.dirname(state_path))
+    except OSError as exc:
+        return None, "Could not migrate legacy Claude integration state: %s" % exc
+    state_data = migrated_state if created else read_json(state_path)
+    if (not valid_claude_integration_state(
+            state_data, paths["settings_realpath"]) or
+            not (claude_settings_match_managed_state(settings, state_data) or
+                 claude_settings_match_restored_state(settings, state_data))):
+        return None, "Migrated Claude integration state is invalid"
+    try:
+        os.unlink(CLAUDE_INTEGRATION_STATE)
+    except OSError as exc:
+        return None, "Legacy Claude integration state cleanup failed: %s" % exc
+    return state_data, None
+
+
+def claude_integration_status_locked(paths):
+    """Evaluate integration state from disk while the target lock is held."""
     version = claude_version()
-    state_data = read_json(CLAUDE_INTEGRATION_STATE)
-    settings = read_json(CLAUDE_SETTINGS)
     if not version:
         return {"state": "not-configured", "message": "Claude Code is not installed or unavailable",
                 "claude_version": None, "can_setup": False}
@@ -293,34 +732,98 @@ def claude_integration_status():
         return {"state": "not-configured",
                 "message": "Claude Code version %s; usage collector support requires 2.1.80 or newer" % detail,
                 "claude_version": version, "can_setup": False}
-    if not os.path.exists(CLAUDE_SETTINGS):
+    if not os.path.exists(paths["settings"]):
         return {"state": "not-configured",
                 "message": "Claude Code must be installed and signed in first.",
                 "claude_version": version, "can_setup": False}
+    settings_status, settings, settings_error = read_json_state(
+        paths["settings"], "Claude settings")
+    if settings_status != "valid":
+        return {"state": "error", "message": settings_error or "Claude settings are missing or invalid",
+                "claude_version": version, "can_setup": False}
     if not isinstance(settings, dict):
-        return {"state": "error", "message": "Claude settings are missing or invalid",
+        return {"state": "error", "message": "Claude settings must contain a JSON object",
+                "claude_version": version, "can_setup": False}
+    state_data, state_error = claude_load_integration_state(paths, settings)
+    if state_error:
+        return {"state": "error", "message": state_error,
                 "claude_version": version, "can_setup": False}
     if isinstance(state_data, dict):
-        current = settings.get("statusLine")
-        current_command = current.get("command") if isinstance(current, dict) else None
-        if current_command == state_data.get("managed_command"):
+        if claude_settings_match_managed_state(settings, state_data):
             return {"state": "configured", "message": "Usage collector is configured",
                     "claude_version": version, "can_setup": True}
+        if claude_settings_match_restored_state(settings, state_data):
+            return {"state": "not-configured", "message": "Usage collector is not configured",
+                    "claude_version": version, "can_setup": True}
         return {"state": "error", "message": "Claude statusline changed after collector setup",
+                "claude_version": version, "can_setup": False}
+    current = settings.get("statusLine")
+    current_command = current.get("command") if isinstance(current, dict) else None
+    collector_wrapper = claude_command_is_own_collector_wrapper(current_command)
+    if collector_wrapper is None:
+        return {"state": "error",
+                "message": "Claude statusline command could not be parsed safely",
+                "claude_version": version, "can_setup": False}
+    if collector_wrapper:
+        return {"state": "error",
+                "message": "Claude statusline already contains the usage collector wrapper, but its integration state is missing",
                 "claude_version": version, "can_setup": False}
     return {"state": "not-configured",
             "message": "Claude Code supports the usage collector; it is not configured",
             "claude_version": version, "can_setup": True}
 
 
-def claude_integration_setup():
-    """Install or confirm the managed wrapper and return an ok/state object."""
-    status = claude_integration_status()
+def claude_integration_status(profile_dir):
+    """Return public state after a locked, canonical-target disk evaluation."""
+    paths, profile_error = claude_integration_paths(profile_dir)
+    if profile_error:
+        return {"state": "error", "message": profile_error,
+                "claude_version": None, "can_setup": False}
+    lock_fd, lock_error = claude_acquire_integration_lock(paths)
+    if lock_error:
+        return {"state": "error", "message": lock_error,
+                "claude_version": None, "can_setup": False}
+    try:
+        if not claude_settings_alias_is_stable(paths):
+            return {"state": "error", "message": "Claude settings path changed before status evaluation",
+                    "claude_version": None, "can_setup": False}
+        return claude_integration_status_locked(paths)
+    finally:
+        os.close(lock_fd)
+
+
+def claude_integration_setup(profile_dir):
+    """Install or confirm the wrapper under the canonical settings lock."""
+    paths, profile_error = claude_integration_paths(profile_dir)
+    if profile_error:
+        return {"ok": False, "state": "error", "message": profile_error,
+                "claude_version": None, "can_setup": False}
+    lock_fd, lock_error = claude_acquire_integration_lock(paths)
+    if lock_error:
+        return {"ok": False, "state": "error", "message": lock_error,
+                "claude_version": None, "can_setup": False}
+    try:
+        if not claude_settings_alias_is_stable(paths):
+            return {"ok": False, "state": "error",
+                    "message": "Claude settings path changed before setup",
+                    "claude_version": None, "can_setup": False}
+        return claude_integration_setup_locked(paths)
+    finally:
+        os.close(lock_fd)
+
+
+def claude_integration_setup_locked(paths):
+    status = claude_integration_status_locked(paths)
     if status["state"] == "configured":
         return {"ok": True, **status}
     if not status["can_setup"]:
         return {"ok": False, **status}
-    settings = read_json(CLAUDE_SETTINGS)
+    settings_status, settings, settings_error = read_json_state(
+        paths["settings"], "Claude settings")
+    if settings_status != "valid" or not isinstance(settings, dict):
+        return {"ok": False, "state": "error",
+                "message": settings_error or "Claude settings must contain a JSON object",
+                "claude_version": status["claude_version"], "can_setup": False}
     previous_present = "statusLine" in settings
     previous = settings.get("statusLine")
     if previous is not None and not isinstance(previous, dict):
@@ -329,16 +832,21 @@ def claude_integration_setup():
     installed = dict(previous or {})
     command = managed_claude_command(previous)
     installed["command"] = command
-    state_data = {"previous_statusline_present": previous_present,
+    state_data = {"settings_realpath": paths["settings_realpath"],
+                  "previous_statusline_present": previous_present,
                   "previous_statusline": previous, "managed_command": command}
     try:
-        atomic_write_json(CLAUDE_INTEGRATION_STATE, state_data, os.path.dirname(CLAUDE_INTEGRATION_STATE))
+        atomic_write_json(paths["integration_state"], state_data,
+                          os.path.dirname(paths["integration_state"]))
+        state_identity = file_identity(paths["integration_state"])
         updated = dict(settings)
         updated["statusLine"] = installed
-        atomic_write_json(CLAUDE_SETTINGS, updated, os.path.dirname(CLAUDE_SETTINGS))
+        atomic_write_settings_json(paths["settings_realpath"], updated)
     except OSError as exc:
         try:
-            os.unlink(CLAUDE_INTEGRATION_STATE)
+            if ("state_identity" in locals() and
+                    file_identity(paths["integration_state"]) == state_identity):
+                os.unlink(paths["integration_state"])
         except OSError:
             pass
         return {"ok": False, "state": "error", "message": "Could not configure usage collector: %s" % exc,
@@ -347,23 +855,46 @@ def claude_integration_setup():
             "claude_version": status["claude_version"], "can_setup": True}
 
 
-def claude_integration_remove():
-    """Restore saved settings or return a conflict error without writing."""
-    state_data = read_json(CLAUDE_INTEGRATION_STATE)
-    settings = read_json(CLAUDE_SETTINGS)
-    if not isinstance(state_data, dict) or not isinstance(settings, dict):
+def claude_integration_remove(profile_dir):
+    """Restore saved settings under lock and unlink only unchanged own state."""
+    paths, profile_error = claude_integration_paths(profile_dir)
+    if profile_error:
+        return {"ok": False, "state": "error", "message": profile_error}
+    lock_fd, lock_error = claude_acquire_integration_lock(paths)
+    if lock_error:
+        return {"ok": False, "state": "error", "message": lock_error}
+    try:
+        if not claude_settings_alias_is_stable(paths):
+            return {"ok": False, "state": "error",
+                    "message": "Claude settings path changed before removal"}
+        return claude_integration_remove_locked(paths)
+    finally:
+        os.close(lock_fd)
+
+
+def claude_integration_remove_locked(paths):
+    settings_status, settings, settings_error = read_json_state(
+        paths["settings"], "Claude settings")
+    if settings_status not in ("missing", "valid"):
+        return {"ok": False, "state": "error", "message": settings_error}
+    if not isinstance(settings, dict):
         return {"ok": False, "state": "not-configured", "message": "No managed integration found"}
-    current = settings.get("statusLine")
-    current_command = current.get("command") if isinstance(current, dict) else None
-    if current_command != state_data.get("managed_command"):
-        already_restored = (
-            (state_data.get("previous_statusline_present") and
-             current == state_data.get("previous_statusline")) or
-            (not state_data.get("previous_statusline_present") and "statusLine" not in settings)
-        )
-        if already_restored:
+    state_data, state_error = claude_load_integration_state(paths, settings)
+    if state_error:
+        return {"ok": False, "state": "error", "message": state_error}
+    if not isinstance(state_data, dict):
+        return {"ok": False, "state": "not-configured", "message": "No managed integration found"}
+    state_identity = file_identity(paths["integration_state"])
+    if state_identity is None:
+        return {"ok": False, "state": "error",
+                "message": "Claude integration state disappeared during removal"}
+    if not claude_settings_match_managed_state(settings, state_data):
+        if claude_settings_match_restored_state(settings, state_data):
             try:
-                os.unlink(CLAUDE_INTEGRATION_STATE)
+                if file_identity(paths["integration_state"]) != state_identity:
+                    return {"ok": False, "state": "error",
+                            "message": "Claude integration state changed during removal"}
+                os.unlink(paths["integration_state"])
             except OSError as exc:
                 return {"ok": False, "state": "error",
                         "message": "Settings restored, but integration state cleanup failed: %s" % exc}
@@ -376,8 +907,11 @@ def claude_integration_remove():
     else:
         restored.pop("statusLine", None)
     try:
-        atomic_write_json(CLAUDE_SETTINGS, restored, os.path.dirname(CLAUDE_SETTINGS))
-        os.unlink(CLAUDE_INTEGRATION_STATE)
+        atomic_write_settings_json(paths["settings_realpath"], restored)
+        if file_identity(paths["integration_state"]) != state_identity:
+            return {"ok": False, "state": "error",
+                    "message": "Settings restored, but integration state changed during removal"}
+        os.unlink(paths["integration_state"])
     except OSError as exc:
         return {"ok": False, "state": "error", "message": "Could not remove integration: %s" % exc}
     return {"ok": True, "state": "not-configured", "message": "Usage collector removed"}
@@ -486,8 +1020,148 @@ def claude_from_api(data, show_extra_usage=False):
     return windows
 
 
-def claude_local_estimate(cap_5h, cap_7d):
-    """Best-effort offline estimate parsed directly from ~/.claude/projects.
+def claude_credentials_oauth(credentials):
+    """Return validated per-profile OAuth data, or an explicit schema error."""
+    if not isinstance(credentials, dict):
+        return None, "Claude profile credentials must contain a JSON object"
+    if "claudeAiOauth" not in credentials or credentials["claudeAiOauth"] is None:
+        return {}, None
+    oauth = credentials["claudeAiOauth"]
+    if not isinstance(oauth, dict):
+        return None, ("Claude profile credentials contain invalid OAuth data: "
+                      "claudeAiOauth must be a JSON object or null")
+    if "accessToken" in oauth:
+        token = oauth["accessToken"]
+        if token is not None and (not isinstance(token, str) or not token.strip()):
+            return None, ("Claude profile credentials contain invalid OAuth data: "
+                          "accessToken must be null or a non-empty string")
+    if "subscriptionType" in oauth:
+        plan = oauth["subscriptionType"]
+        if plan is not None and not isinstance(plan, str):
+            return None, ("Claude profile credentials contain invalid OAuth data: "
+                          "subscriptionType must be null or a string")
+    return oauth, None
+
+
+def claude_usage_block_schema_error(block, utilization_key, reset_key):
+    if utilization_key in block and block[utilization_key] is not None:
+        if not valid_percentage(block[utilization_key]):
+            return "%s must be a percentage" % utilization_key
+    if reset_key in block and block[reset_key] is not None:
+        raw_reset = block[reset_key]
+        reset = iso_to_epoch(raw_reset) if isinstance(raw_reset, str) else raw_reset
+        if not valid_reset_timestamp(reset, allow_none=False):
+            return "%s must be a valid reset timestamp" % reset_key
+    return None
+
+
+def claude_collector_cache_schema_error(cache):
+    """Describe malformed collector structure without treating staleness as corruption."""
+    if not isinstance(cache, dict):
+        return "root must be a JSON object"
+    if ("fetched_at" in cache and
+            not valid_external_number(cache["fetched_at"], 0,
+                                      CLAUDE_MAX_RESET_TIMESTAMP)):
+        return "fetched_at must be a valid timestamp"
+    if "rate_limits" not in cache:
+        return None
+    rate_limits = cache["rate_limits"]
+    if not isinstance(rate_limits, dict):
+        return "rate_limits must be a JSON object"
+    for _key, _label, source in CLAUDE_API_WINDOWS:
+        block = rate_limits.get(source)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            return "rate_limits.%s must be a JSON object or null" % source
+        error = claude_usage_block_schema_error(
+            block, "used_percentage", "resets_at")
+        if error:
+            return "rate_limits.%s.%s" % (source, error)
+    return None
+
+
+def claude_api_data_schema_error(data):
+    if not isinstance(data, dict):
+        return "data must be a JSON object or null"
+    usage_sources = set(source for _key, _label, source in CLAUDE_API_WINDOWS)
+    usage_sources.update(
+        key for key in data if key.startswith(CLAUDE_API_EXTRA_PREFIX))
+    for source in sorted(usage_sources):
+        block = data.get(source)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            return "data.%s must be a JSON object or null" % source
+        error = claude_usage_block_schema_error(block, "utilization", "resets_at")
+        if error:
+            return "data.%s.%s" % (source, error)
+
+    extra = data.get("extra_usage")
+    if extra is None:
+        return None
+    if not isinstance(extra, dict):
+        return "data.extra_usage must be a JSON object or null"
+    if "is_enabled" in extra and type(extra["is_enabled"]) is not bool:
+        return "data.extra_usage.is_enabled must be a boolean"
+    for field in ("utilization",):
+        if field in extra and extra[field] is not None and not valid_percentage(extra[field]):
+            return "data.extra_usage.%s must be a percentage" % field
+    for field in ("used_credits", "monthly_limit"):
+        if (field in extra and extra[field] is not None and
+                not valid_external_number(extra[field], 0)):
+            return "data.extra_usage.%s must be a non-negative number" % field
+    if "decimal_places" in extra and extra["decimal_places"] is not None:
+        decimal_places = extra["decimal_places"]
+        if (isinstance(decimal_places, bool) or not isinstance(decimal_places, int) or
+                not 0 <= decimal_places <= 12):
+            return "data.extra_usage.decimal_places must be an integer from 0 to 12"
+    if ("currency" in extra and extra["currency"] is not None and
+            not isinstance(extra["currency"], str)):
+        return "data.extra_usage.currency must be null or a string"
+    return None
+
+
+def claude_oauth_cache_schema_error(cache):
+    """Describe malformed OAuth cache structure while allowing empty/expired state."""
+    if not isinstance(cache, dict):
+        return "root must be a JSON object"
+    for field in ("fetched_at", "last_attempt_at"):
+        value = cache.get(field)
+        if (field in cache and value is not None and
+                not valid_external_number(value, 0, CLAUDE_MAX_RESET_TIMESTAMP)):
+            return "%s must be null or a valid timestamp" % field
+    if ("retry_after_until" in cache and
+            not valid_external_number(cache["retry_after_until"], 0,
+                                      CLAUDE_MAX_RESET_TIMESTAMP)):
+        return "retry_after_until must be a valid timestamp"
+    data = cache.get("data")
+    if data is None:
+        return None
+    return claude_api_data_schema_error(data)
+
+
+def read_claude_oauth_cache_state(path):
+    """Return only a syntactically and semantically valid OAuth cache object."""
+    status, cache, error = read_json_state(path, "Claude OAuth cache")
+    if status != "valid":
+        return status, None, error
+    schema_error = claude_oauth_cache_schema_error(cache)
+    if schema_error:
+        return "invalid", None, "Claude OAuth cache is corrupt: %s" % schema_error
+    return "valid", cache, None
+
+
+def combined_errors(*errors):
+    unique = []
+    for error in errors:
+        if error and error not in unique:
+            unique.append(error)
+    return " · ".join(unique) if unique else None
+
+
+def claude_local_estimate(projects_path, cap_5h, cap_7d, deadline=None):
+    """Best-effort offline estimate parsed from one profile's projects directory.
 
     Sums every integer field found inside `message.usage` (input/output/cache
     tokens) per record, bucketed into the 5h and 7d windows by the record
@@ -495,7 +1169,8 @@ def claude_local_estimate(cap_5h, cap_7d):
     than hard-coding key names. Returns (windows, total_files) or None when no
     usage data is present at all (so the caller can fail honestly).
     """
-    if not os.path.isdir(CLAUDE_PROJECTS):
+    if ((deadline is not None and time.monotonic() >= deadline) or
+            not os.path.isdir(projects_path)):
         return None
 
     now = time.time()
@@ -505,7 +1180,9 @@ def claude_local_estimate(cap_5h, cap_7d):
     sum_7d = 0
     found = False
 
-    for path in glob.iglob(os.path.join(CLAUDE_PROJECTS, "**", "*.jsonl"), recursive=True):
+    for path in glob.iglob(os.path.join(projects_path, "**", "*.jsonl"), recursive=True):
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
         try:
             if os.path.getmtime(path) < cut_7d:
                 continue
@@ -514,6 +1191,8 @@ def claude_local_estimate(cap_5h, cap_7d):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 for line in fh:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return None
                     line = line.strip()
                     if not line or '"usage"' not in line:
                         continue
@@ -528,7 +1207,10 @@ def claude_local_estimate(cap_5h, cap_7d):
                     ts = iso_to_epoch(obj.get("timestamp"))
                     if ts is None or ts < cut_7d:
                         continue
-                    tokens = sum(v for v in usage.values() if isinstance(v, int))
+                    tokens = sum(
+                        value for value in usage.values()
+                        if (type(value) is int and 0 <= value <= MAX_SAFE_EXTERNAL_NUMBER)
+                    )
                     if tokens <= 0:
                         continue
                     found = True
@@ -539,6 +1221,9 @@ def claude_local_estimate(cap_5h, cap_7d):
             continue
 
     if not found:
+        return None
+
+    if deadline is not None and time.monotonic() >= deadline:
         return None
 
     windows = []
@@ -573,39 +1258,58 @@ def write_cache(path, obj):
         pass
 
 
-def claude_claim_oauth_attempt(now):
+def claude_claim_oauth_attempt(now, cache_path, lock_path, deadline=None):
     """Atomically claim the current OAuth poll across Plasma processes.
 
-    Returns (claimed, latest_cache, error). The lock is held only for cache
-    re-evaluation and the durable claim, never during the network request.
+    Returns (claimed, latest_cache, error).  A successful claim can carry a
+    cache error when its locked re-read found corrupt data. The lock is held
+    only for cache re-evaluation and the durable claim, never during the
+    network request.
     """
     fd = None
     try:
-        lock_dir = os.path.dirname(CLAUDE_OAUTH_LOCK)
-        cache_dir = os.path.dirname(CLAUDE_CACHE)
+        lock_dir = os.path.dirname(lock_path)
+        cache_dir = os.path.dirname(cache_path)
         os.makedirs(lock_dir, mode=0o700, exist_ok=True)
         os.chmod(lock_dir, 0o700)
-        fd = os.open(CLAUDE_OAUTH_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         os.fchmod(fd, 0o600)
     except OSError as exc:
         if fd is not None:
             os.close(fd)
-        return False, read_cache(CLAUDE_CACHE) or {}, "usage poll lock failed: %s" % exc
-    deadline = time.monotonic() + CLAUDE_OAUTH_LOCK_TIMEOUT
+        _status, cache, cache_error = read_claude_oauth_cache_state(cache_path)
+        return (False, cache or {}, combined_errors(
+            "usage poll lock failed: %s" % exc, cache_error))
+    lock_deadline = time.monotonic() + CLAUDE_OAUTH_LOCK_TIMEOUT
+    if deadline is not None:
+        lock_deadline = min(lock_deadline, deadline)
     try:
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    return False, read_cache(CLAUDE_CACHE) or {}, "usage poll lock timed out"
+                if time.monotonic() >= lock_deadline:
+                    _status, cache, cache_error = read_claude_oauth_cache_state(
+                        cache_path)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return (False, cache or {}, combined_errors(
+                            "helper deadline exceeded while waiting for usage poll lock",
+                            cache_error))
+                    return (False, cache or {}, combined_errors(
+                        "usage poll lock timed out", cache_error))
                 time.sleep(0.01)
+            except OSError as exc:
+                _status, cache, cache_error = read_claude_oauth_cache_state(
+                    cache_path)
+                return (False, cache or {}, combined_errors(
+                    "usage poll lock failed: %s" % exc, cache_error))
         # The caller's timestamp may predate time spent waiting for the lock.
         # Re-sample inside the critical section so an earlier process's claim
         # cannot look spuriously "from the future" to this contender.
         now = time.time()
-        cache = read_cache(CLAUDE_CACHE) or {}
+        _status, cache, cache_error = read_claude_oauth_cache_state(cache_path)
+        cache = cache or {}
         last_attempt = cache.get("last_attempt_at", cache.get("fetched_at"))
         retry_until = cache.get("retry_after_until", 0)
         if cache_age_is_valid(last_attempt, CLAUDE_OAUTH_POLL_INTERVAL, now) or now < retry_until:
@@ -617,44 +1321,65 @@ def claude_claim_oauth_attempt(now):
             "retry_after_until": retry_until,
         }
         try:
-            atomic_write_json(CLAUDE_CACHE, claimed, cache_dir)
+            atomic_write_json(cache_path, claimed, cache_dir)
         except OSError as exc:
-            return False, cache, "usage poll claim failed: %s" % exc
-        return True, claimed, None
+            return False, cache, combined_errors(
+                "usage poll claim failed: %s" % exc, cache_error)
+        return True, claimed, cache_error
     finally:
         os.close(fd)
 
 
-def claude_finish_oauth_attempt(attempt_at, data=None, retry_after_until=None):
-    """Publish an attempt result without overwriting a newer successful poll."""
+def claude_finish_oauth_attempt(attempt_at, cache_path, lock_path, data=None,
+                                retry_after_until=None, deadline=None):
+    """Publish an attempt result, returning an explicit cache-write error."""
     fd = None
     try:
-        lock_dir = os.path.dirname(CLAUDE_OAUTH_LOCK)
-        cache_dir = os.path.dirname(CLAUDE_CACHE)
+        lock_dir = os.path.dirname(lock_path)
+        cache_dir = os.path.dirname(cache_path)
         os.makedirs(lock_dir, mode=0o700, exist_ok=True)
-        fd = os.open(CLAUDE_OAUTH_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         os.fchmod(fd, 0o600)
-        deadline = time.monotonic() + CLAUDE_OAUTH_LOCK_TIMEOUT
+    except OSError as exc:
+        if fd is not None:
+            os.close(fd)
+        _status, _cache, cache_error = read_claude_oauth_cache_state(cache_path)
+        return combined_errors("usage cache publish lock failed: %s" % exc,
+                               cache_error)
+    try:
+        lock_deadline = time.monotonic() + CLAUDE_OAUTH_LOCK_TIMEOUT
+        if deadline is not None:
+            lock_deadline = min(lock_deadline, deadline)
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    return
+                if time.monotonic() >= lock_deadline:
+                    _status, _cache, cache_error = read_claude_oauth_cache_state(
+                        cache_path)
+                    return combined_errors("usage cache publish lock timed out",
+                                           cache_error)
                 time.sleep(0.01)
-        current = read_cache(CLAUDE_CACHE) or {}
+            except OSError as exc:
+                _status, _cache, cache_error = read_claude_oauth_cache_state(
+                    cache_path)
+                return combined_errors("usage cache publish lock failed: %s" % exc,
+                                       cache_error)
+        _status, current, _cache_error = read_claude_oauth_cache_state(cache_path)
+        current = current or {}
         if current.get("last_attempt_at", attempt_at) > attempt_at:
-            return
+            return None
         updated = dict(current)
         if data is not None:
             updated.update({"fetched_at": attempt_at, "data": data,
                             "retry_after_until": 0})
         elif retry_after_until is not None:
             updated["retry_after_until"] = retry_after_until
-        atomic_write_json(CLAUDE_CACHE, updated, cache_dir)
-    except (OSError, TypeError):
-        return
+        atomic_write_json(cache_path, updated, cache_dir)
+        return None
+    except (OSError, TypeError) as exc:
+        return "usage cache publish failed: %s" % exc
     finally:
         if fd is not None:
             os.close(fd)
@@ -678,48 +1403,169 @@ def read_token_file(path):
         return None
 
 
-def provider_claude(cfg):
-    creds = read_json(CLAUDE_CREDENTIALS) or {}
-    oauth = creds.get("claudeAiOauth") or {}
-    plan = oauth.get("subscriptionType")
+def claude_profile_paths(profile):
+    suffix = profile["id"].removeprefix("claude-")
+    return {
+        "credentials": os.path.join(profile["canonical_path"], ".credentials.json"),
+        "projects": os.path.join(profile["canonical_path"], "projects"),
+        "settings": os.path.join(profile["canonical_path"], "settings.json"),
+        "oauth_cache": os.path.join(CACHE_DIR, "claude-usage-%s.json" % suffix),
+        "oauth_lock": os.path.join(CACHE_DIR, "claude-oauth-%s.lock" % suffix),
+        "collector_cache": os.path.join(CACHE_DIR, "claude-statusline-%s.json" % suffix),
+    }
+
+
+def valid_legacy_claude_oauth_cache(cache):
+    return (isinstance(cache, dict) and
+            valid_external_number(cache.get("fetched_at"), 0,
+                                  CLAUDE_MAX_RESET_TIMESTAMP) and
+            isinstance(cache.get("data"), dict) and
+            bool(claude_from_api(cache["data"], show_extra_usage=True)))
+
+
+def valid_legacy_claude_collector_cache(cache):
+    return (isinstance(cache, dict) and
+            valid_external_number(cache.get("fetched_at"), 0,
+                                  CLAUDE_MAX_RESET_TIMESTAMP) and
+            bool(claude_from_collector(cache)))
+
+
+def migrate_legacy_claude_caches(profile, paths):
+    statuses = {
+        "oauth_cache": {"status": "not-default", "error": None},
+        "collector_cache": {"status": "not-default", "error": None},
+    }
+    default_profile = os.path.realpath(os.path.expanduser("~/.claude"))
+    if profile["canonical_path"] != default_profile:
+        return statuses
+    migrations = (
+        ("oauth_cache", "OAuth", CLAUDE_CACHE, paths["oauth_cache"],
+         valid_legacy_claude_oauth_cache),
+        ("collector_cache", "collector", CLAUDE_STATUSLINE_CACHE,
+         paths["collector_cache"], valid_legacy_claude_collector_cache),
+    )
+    for key, label, legacy_path, destination, validator in migrations:
+        if os.path.exists(destination):
+            statuses[key] = {"status": "exists", "error": None}
+            continue
+        legacy_data = read_cache(legacy_path)
+        if not validator(legacy_data):
+            statuses[key] = {"status": "invalid", "error": None}
+            continue
+        try:
+            created = atomic_create_json(
+                destination, legacy_data, os.path.dirname(destination))
+        except OSError as exc:
+            error = "legacy %s cache migration failed: %s" % (label, exc)
+            statuses[key] = {"status": "error", "error": error}
+        else:
+            statuses[key] = {
+                "status": "migrated" if created else "exists",
+                "error": None,
+            }
+    return statuses
+
+
+def provider_claude(cfg, profile, deadline=None):
+    migration_errors = []
+    source_errors = []
+
+    def result(available, source, plan, windows, error):
+        if migration_errors:
+            migration_error = " · ".join(migration_errors)
+            error = "%s · %s" % (error, migration_error) if error else migration_error
+        item = provider(profile["id"], profile["label"], available, source, plan,
+                        windows, error, base_provider="claude")
+        item["profile_path"] = profile["canonical_path"]
+        return item
+
+    if profile.get("profile_error"):
+        return result(False, None, None, [], profile["profile_error"])
+    if deadline is not None and time.monotonic() >= deadline:
+        return result(False, None, None, [], "helper deadline exceeded before profile query")
+
+    paths = claude_profile_paths(profile)
+    migration_statuses = migrate_legacy_claude_caches(profile, paths)
+    migration_errors.extend(
+        status["error"] for status in migration_statuses.values() if status["error"])
+    plan = None
+    now = time.time()
+    collector_status, collector_cache, collector_error = read_json_state(
+        paths["collector_cache"], "Claude collector cache")
+    if collector_status in ("invalid", "unreadable"):
+        source_errors.append(collector_error)
+        collector_cache = {}
+    elif collector_status == "missing":
+        collector_cache = {}
+    else:
+        collector_schema_error = claude_collector_cache_schema_error(
+            collector_cache)
+        if collector_schema_error:
+            source_errors.append("Claude collector cache is corrupt: %s" %
+                                 collector_schema_error)
+            collector_cache = {}
+    if cache_age_is_valid(collector_cache.get("fetched_at"), CLAUDE_COLLECTOR_MAX_AGE, now):
+        collector_windows = unexpired_windows(claude_from_collector(collector_cache), now)
+        if collector_windows:
+            return result(True, "statusline", plan, collector_windows, None)
 
     # Token precedence: explicit env token > configured token file > the
-    # default ~/.claude/.credentials.json. A configured-but-unreadable token
-    # file is a hard error, not a silent fall-through to the default source.
+    # current profile's .credentials.json. Earlier real data sources do not
+    # depend on credentials, and explicit token sources must never be blocked
+    # by malformed default credentials. A configured-but-unreadable token file
+    # remains a hard error.
     token = cfg["claude_token"]
     if not token and cfg["claude_token_file"]:
         token = read_token_file(cfg["claude_token_file"])
         if not token:
-            return provider("claude", "Claude", False, None, plan, [],
-                            "cannot read token file %s" % cfg["claude_token_file"])
+            return result(False, None, None, [],
+                          "cannot read token file %s" % cfg["claude_token_file"])
     if not token:
-        token = oauth.get("accessToken")
+        credentials_status, creds, credentials_error = read_json_state(
+            paths["credentials"], "Claude profile credentials")
+        if credentials_status in ("invalid", "unreadable"):
+            source_errors.append(credentials_error)
+            creds = {}
+        elif credentials_status == "missing":
+            creds = {}
+        oauth, oauth_error = claude_credentials_oauth(creds)
+        if oauth_error:
+            source_errors.append(oauth_error)
+        else:
+            plan = oauth.get("subscriptionType")
+            token = oauth.get("accessToken")
 
-    now = time.time()
-    collector_cache = read_cache(CLAUDE_STATUSLINE_CACHE) or {}
-    if cache_age_is_valid(collector_cache.get("fetched_at"), CLAUDE_COLLECTOR_MAX_AGE, now):
-        collector_windows = unexpired_windows(claude_from_collector(collector_cache), now)
-        if collector_windows:
-            return provider("claude", "Claude", True, "statusline", plan, collector_windows, None)
-
-    cache = read_cache(CLAUDE_CACHE) or {}
+    oauth_cache_status, cache, oauth_cache_error = read_claude_oauth_cache_state(
+        paths["oauth_cache"])
+    if oauth_cache_status in ("invalid", "unreadable"):
+        source_errors.append(oauth_cache_error)
+        cache = {}
+    elif oauth_cache_status == "missing":
+        cache = {}
     cached_data = cache.get("data")
     fetched_at = cache.get("fetched_at")
     last_attempt_at = cache.get("last_attempt_at", fetched_at)
     retry_until = cache.get("retry_after_until", 0)
 
-    def from_cache(data, stale=False):
+    def from_cache(data, stale=False, cached_at=None):
         windows = unexpired_windows(claude_from_api(data, cfg["claude_extra_usage"]), now)
         if not windows:
             return None
         if not stale:
-            return provider("claude", "Claude", True, "api", plan, windows, None)
-        note = "cached usage (%ds old)" % int(now - fetched_at)
-        return provider("claude", "Claude", True, "api-cached", plan, windows, note)
+            return result(True, "api", plan, windows, None)
+        if cached_at is None:
+            cached_at = fetched_at
+        note = "cached usage (%ds old)" % int(now - cached_at)
+        if source_errors:
+            note = "%s · %s" % (note, " · ".join(source_errors))
+        return result(True, "api-cached", plan, windows, note)
 
     cache_usable = cached_data is not None and cache_age_is_valid(
         fetched_at, CLAUDE_OAUTH_MAX_AGE, now
     )
+    fallback_cached_data = cached_data
+    fallback_fetched_at = fetched_at
+    fallback_cache_usable = cache_usable
     poll_due = not cache_age_is_valid(last_attempt_at, CLAUDE_OAUTH_POLL_INTERVAL, now)
 
     # Share both the ordinary polling interval and a server-requested backoff
@@ -732,14 +1578,20 @@ def provider_claude(cfg):
     # 2) Refresh from the API. Claim under an inter-process lock, then release
     # it before performing network I/O.
     api_error = None
+    claim_cache_error = None
     if token and poll_due and now >= retry_until:
-        claimed, latest_cache, claim_error = claude_claim_oauth_attempt(now)
+        claimed, latest_cache, claim_error = claude_claim_oauth_attempt(
+            now, paths["oauth_cache"], paths["oauth_lock"], deadline=deadline)
         latest_cache = latest_cache or {}
         cached_data = latest_cache.get("data")
         fetched_at = latest_cache.get("fetched_at")
         retry_until = latest_cache.get("retry_after_until", 0)
         cache_usable = cached_data is not None and cache_age_is_valid(
             fetched_at, CLAUDE_OAUTH_MAX_AGE, now)
+        if cache_usable:
+            fallback_cached_data = cached_data
+            fallback_fetched_at = fetched_at
+            fallback_cache_usable = True
         if not claimed:
             if cache_usable:
                 served = from_cache(cached_data, stale=True)
@@ -749,44 +1601,249 @@ def provider_claude(cfg):
                     return served
             api_error = claim_error or "usage query deferred until the next polling interval"
         else:
+            claim_cache_error = claim_error
             attempt_at = latest_cache.get("last_attempt_at", now)
             try:
-                data = http_get_json(CLAUDE_USAGE_URL, token)
-                served = from_cache(data, stale=False)
-                if served:
-                    claude_finish_oauth_attempt(attempt_at, data=data)
-                    return served
-                api_error = "usage API returned no usable windows"
+                if deadline is None:
+                    data = http_get_json(CLAUDE_USAGE_URL, token)
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("helper deadline exceeded before usage API query")
+                    data = http_get_json(
+                        CLAUDE_USAGE_URL, token, timeout=min(HTTP_TIMEOUT, remaining))
+                data_schema_error = claude_api_data_schema_error(data)
+                if data_schema_error:
+                    api_error = "usage API data schema error: %s" % data_schema_error
+                else:
+                    served = from_cache(data, stale=False)
+                    if served:
+                        finish_error = claude_finish_oauth_attempt(
+                            attempt_at, paths["oauth_cache"], paths["oauth_lock"],
+                            data=data, deadline=deadline)
+                        if finish_error:
+                            served["error"] = finish_error
+                        return served
+                    api_error = "usage API returned no usable windows"
             except urllib.error.HTTPError as exc:
                 api_error = "usage API failed: HTTP Error %s" % exc.code
                 if exc.code == 429:
                     backoff = parse_retry_after(exc) or 120
                     retry_at = int(attempt_at + backoff)
                     api_error = "usage query rate-limited; retry after %d" % retry_at
-                    claude_finish_oauth_attempt(attempt_at, retry_after_until=retry_at)
+                    finish_error = claude_finish_oauth_attempt(
+                        attempt_at, paths["oauth_cache"], paths["oauth_lock"],
+                        retry_after_until=retry_at, deadline=deadline)
+                    api_error = combined_errors(api_error, finish_error)
             except Exception as exc:  # noqa: BLE001 - any failure -> serve cache / fallback
                 api_error = "usage API failed: %s" % exc
     elif not token:
-        api_error = "no access token in ~/.claude/.credentials.json"
+        api_error = "no access token for profile"
     else:
         api_error = "usage query deferred until the next polling interval"
 
+    if claim_cache_error and api_error:
+        api_error = combined_errors(api_error, claim_cache_error)
+
+    if deadline is not None and time.monotonic() >= deadline:
+        return result(False, None, plan, [],
+                      "helper deadline exceeded during profile query")
+
     # 3) API failed: serve the last good response (stale) rather than a null
     #    estimate -- a transient 429 should not blank out the widget.
-    if cache_usable:
-        served = from_cache(cached_data, stale=True)
+    if fallback_cache_usable:
+        served = from_cache(fallback_cached_data, stale=True, cached_at=fallback_fetched_at)
         if served:
             served["error"] = "%s · %s" % (served["error"], api_error)
             return served
 
     # 4) No cache at all: optional local token estimate, else hard error.
     if cfg["claude_local_fallback"]:
-        estimate = claude_local_estimate(cfg["claude_cap_5h"], cfg["claude_cap_7d"])
+        estimate = claude_local_estimate(
+            paths["projects"], cfg["claude_cap_5h"], cfg["claude_cap_7d"],
+            deadline=deadline)
         if estimate is not None:
-            return provider("claude", "Claude", True, "local-estimate", plan, estimate,
-                            f"API unavailable, showing local token estimate ({api_error})")
+            if source_errors:
+                api_error = "%s · %s" % (api_error, " · ".join(source_errors))
+            return result(True, "local-estimate", plan, estimate,
+                          f"API unavailable, showing local token estimate ({api_error})")
 
-    return provider("claude", "Claude", False, None, plan, [], api_error)
+    if source_errors:
+        api_error = "%s · %s" % (api_error, " · ".join(source_errors))
+    return result(False, None, plan, [], api_error)
+
+
+def claude_profile_error_result(profile, detail):
+    item = provider(profile["id"], profile["label"], False, None, None, [],
+                    detail, base_provider="claude")
+    item["profile_path"] = profile["canonical_path"]
+    return item
+
+
+def claude_profile_worker(cfg, profile, provider_call, deadline, output,
+                          inherited_read_fds):
+    """Run one profile query and send exactly one JSON result through a pipe."""
+    for fd in inherited_read_fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        if time.monotonic() >= deadline:
+            result = claude_profile_error_result(
+                profile, "helper deadline exceeded before profile query")
+        else:
+            try:
+                result = provider_call(cfg, profile, deadline)
+            except BaseException as exc:  # isolate every forked provider task
+                result = claude_profile_error_result(
+                    profile, "internal error: %s" % exc)
+        try:
+            payload = json.dumps(result, allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            payload = json.dumps(claude_profile_error_result(
+                profile, "internal error: provider result is not valid JSON: %s" % exc)
+            ).encode("utf-8")
+        output.send_bytes(payload)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+    finally:
+        output.close()
+
+
+def claude_close_profile_process(process, terminate=False):
+    """Reap and close one child process within a shared bounded cleanup window."""
+    if terminate and process.is_alive():
+        process.terminate()
+    process.join(CLAUDE_PROFILE_CLEANUP_TIMEOUT)
+    if process.is_alive():
+        process.kill()
+        process.join(CLAUDE_PROFILE_CLEANUP_TIMEOUT)
+    if not process.is_alive():
+        process.close()
+
+
+def claude_discard_unstarted_profile_process(process):
+    """Release a Process whose start failed, including a partially started child."""
+    if process is None:
+        return
+    try:
+        if process.is_alive():
+            claude_close_profile_process(process, terminate=True)
+            return
+    except (AssertionError, OSError, ValueError):
+        pass
+    try:
+        process.close()
+    except (AssertionError, OSError, ValueError):
+        pass
+
+
+def collect_claude_profiles(cfg, profiles, provider_call=None, deadline=None,
+                            max_workers=CLAUDE_PROFILE_MAX_WORKERS):
+    """Collect profiles in killable forked workers, preserving discovery order."""
+    if not profiles:
+        return []
+    try:
+        if "fork" not in multiprocessing.get_all_start_methods():
+            raise RuntimeError("Claude profile collection requires multiprocessing fork")
+        context = multiprocessing.get_context("fork")
+    except Exception as exc:  # process infrastructure must not break main JSON
+        return [claude_profile_error_result(
+            profile, "internal error: could not initialize profile workers: %s" % exc)
+                for profile in profiles]
+    provider_call = provider_claude if provider_call is None else provider_call
+    deadline = (time.monotonic() + HELPER_TOTAL_DEADLINE_SECONDS
+                if deadline is None else deadline)
+    worker_count = max(1, min(int(max_workers), CLAUDE_PROFILE_MAX_WORKERS,
+                              len(profiles)))
+    results = [None] * len(profiles)
+    active = {}
+    next_index = 0
+
+    try:
+        while active or next_index < len(profiles):
+            while (next_index < len(profiles) and len(active) < worker_count and
+                   time.monotonic() < deadline):
+                profile = profiles[next_index]
+                reader = None
+                writer = None
+                process = None
+                setup_stage = "create worker pipe"
+                try:
+                    reader, writer = context.Pipe(duplex=False)
+                    inherited_read_fds = [connection.fileno() for connection in active]
+                    inherited_read_fds.append(reader.fileno())
+                    setup_stage = "create worker process"
+                    process = context.Process(
+                        target=claude_profile_worker,
+                        args=(cfg, profile, provider_call, deadline, writer,
+                              inherited_read_fds),
+                    )
+                    setup_stage = "start worker"
+                    process.start()
+                except Exception as exc:
+                    for connection in (reader, writer):
+                        if connection is not None:
+                            try:
+                                connection.close()
+                            except OSError:
+                                pass
+                    claude_discard_unstarted_profile_process(process)
+                    detail = "internal error: could not %s: %s" % (setup_stage, exc)
+                    for index in range(next_index, len(profiles)):
+                        results[index] = claude_profile_error_result(
+                            profiles[index], detail)
+                    next_index = len(profiles)
+                else:
+                    writer.close()
+                    active[reader] = (next_index, process)
+                    next_index += 1
+
+            if not active or time.monotonic() >= deadline:
+                break
+            ready = multiprocessing.connection.wait(
+                list(active), timeout=max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            for reader in ready:
+                index, process = active.pop(reader)
+                try:
+                    payload = reader.recv_bytes().decode("utf-8")
+                    result = json.loads(payload)
+                    if not isinstance(result, dict):
+                        raise ValueError("provider result must be a JSON object")
+                    results[index] = result
+                except (EOFError, OSError, UnicodeError, ValueError) as exc:
+                    results[index] = claude_profile_error_result(
+                        profiles[index], "internal error: invalid worker result: %s" % exc)
+                finally:
+                    reader.close()
+                    claude_close_profile_process(process)
+    finally:
+        running = list(active.items())
+        for reader, (_index, process) in running:
+            reader.close()
+            if process.is_alive():
+                process.terminate()
+        cleanup_deadline = time.monotonic() + CLAUDE_PROFILE_CLEANUP_TIMEOUT
+        for _reader, (_index, process) in running:
+            process.join(max(0, cleanup_deadline - time.monotonic()))
+        for _reader, (_index, process) in running:
+            if process.is_alive():
+                process.kill()
+        cleanup_deadline = time.monotonic() + CLAUDE_PROFILE_CLEANUP_TIMEOUT
+        for _reader, (_index, process) in running:
+            if process.is_alive():
+                process.join(max(0, cleanup_deadline - time.monotonic()))
+            if not process.is_alive():
+                process.close()
+
+    for index, result in enumerate(results):
+        if result is None:
+            results[index] = claude_profile_error_result(
+                profiles[index], "helper deadline exceeded")
+    return results
 
 
 # --------------------------------------------------------------------------- #
@@ -1253,45 +2310,118 @@ DEFAULT_ORDER = ["claude", "codex", "antigravity"]
 def load_config():
     # Keep unknown names (instead of filtering them) so a typo surfaces as an
     # explicit error tile in main() rather than silently expanding to the
-    # default provider set. Duplicates are dropped, order is preserved.
-    enabled = env_str("AI_USAGE_PROVIDERS", "claude,codex,antigravity")
+    # default provider set. Duplicates are dropped, order is preserved. An
+    # explicitly empty value intentionally disables every provider; only a
+    # missing variable selects the default order.
+    enabled = os.environ.get("AI_USAGE_PROVIDERS")
     order = []
-    for p in enabled.split(","):
-        p = p.strip()
-        if p and p not in order:
-            order.append(p)
+    if enabled is None:
+        order = list(DEFAULT_ORDER)
+    else:
+        for p in enabled.split(","):
+            p = p.strip()
+            if p and p not in order:
+                order.append(p)
+    claude_profiles = {"manual": [], "overrides": {}}
+    claude_profiles_error = None
+    raw_claude_profiles = env_str("AI_USAGE_CLAUDE_PROFILES_JSON")
+    if raw_claude_profiles is not None:
+        try:
+            claude_profiles = json.loads(raw_claude_profiles)
+            validate_claude_profiles_config(claude_profiles)
+        except ValueError as exc:
+            claude_profiles = None
+            claude_profiles_error = exc
     return {
-        "providers": order or DEFAULT_ORDER,
+        "providers": order,
         "claude_token": env_str("AI_USAGE_CLAUDE_TOKEN"),
         "claude_token_file": env_str("AI_USAGE_CLAUDE_TOKEN_FILE"),
         "claude_local_fallback": env_bool("AI_USAGE_CLAUDE_LOCAL_FALLBACK", True),
         "claude_extra_usage": env_bool("AI_USAGE_CLAUDE_EXTRA_USAGE", False),
         "claude_cap_5h": env_int("AI_USAGE_CLAUDE_CAP_5H"),
         "claude_cap_7d": env_int("AI_USAGE_CLAUDE_CAP_7D"),
+        "claude_profiles": claude_profiles,
+        "claude_profiles_error": claude_profiles_error,
     }
 
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--claude-integration":
+    helper_deadline = time.monotonic() + HELPER_TOTAL_DEADLINE_SECONDS
+    if len(sys.argv) >= 2 and sys.argv[1] == "--claude-integration":
         actions = {
             "status": claude_integration_status,
             "setup": claude_integration_setup,
             "remove": claude_integration_remove,
         }
-        action = actions.get(sys.argv[2])
-        result = action() if action else {
-            "ok": False, "state": "error", "message": "Unknown Claude integration action"
-        }
+        valid_syntax = (len(sys.argv) == 5 and sys.argv[3] == "--profile" and
+                        bool(sys.argv[4]))
+        action = actions.get(sys.argv[2]) if len(sys.argv) >= 3 else None
+        if not valid_syntax:
+            result = {"ok": False, "state": "error",
+                      "message": "Usage: --claude-integration <status|setup|remove> --profile <directory>"}
+        elif action is None:
+            result = {"ok": False, "state": "error",
+                      "message": "Unknown Claude integration action"}
+        else:
+            result = action(sys.argv[4])
         json.dump(result, sys.stdout)
         sys.stdout.write("\n")
         return
     cfg = load_config()
+    if len(sys.argv) == 2 and sys.argv[1] == "--claude-profiles":
+        if cfg["claude_profiles_error"] is not None:
+            result = {
+                "ok": False,
+                "error": "invalid Claude profile configuration: %s" % cfg["claude_profiles_error"],
+                "profiles": [],
+            }
+        else:
+            result = {"profiles": discover_claude_profiles(cfg["claude_profiles"])}
+        json.dump(result, sys.stdout)
+        sys.stdout.write("\n")
+        return
     providers = []
     for pid in cfg["providers"]:
         fn = PROVIDERS.get(pid)
         if fn is None:
             providers.append(provider(pid, pid.capitalize(), False, None, None, [],
                                       "unknown provider id (valid: %s)" % ", ".join(PROVIDERS)))
+            continue
+        if pid == "claude":
+            profile_error = cfg["claude_profiles_error"]
+            if profile_error is not None:
+                item = provider("claude", "Claude", False, None, None, [],
+                                "invalid Claude profile configuration: %s" % profile_error,
+                                base_provider="claude")
+                item["profile_path"] = None
+                providers.append(item)
+                continue
+            try:
+                claude_profiles = discover_claude_profiles(cfg["claude_profiles"])
+            except ValueError as exc:
+                item = provider("claude", "Claude", False, None, None, [],
+                                "invalid Claude profile configuration: %s" % exc,
+                                base_provider="claude")
+                item["profile_path"] = None
+                providers.append(item)
+                continue
+            if not claude_profiles:
+                item = provider("claude", "Claude", False, None, None, [],
+                                "no Claude profiles found", base_provider="claude")
+                item["profile_path"] = None
+                providers.append(item)
+                continue
+            enabled_profiles = [profile_config for profile_config in claude_profiles
+                                if profile_config["enabled"]]
+            try:
+                providers.extend(collect_claude_profiles(
+                    cfg, enabled_profiles, provider_call=fn,
+                    deadline=helper_deadline))
+            except Exception as exc:  # collection infrastructure must not break JSON
+                providers.extend(
+                    claude_profile_error_result(
+                        profile_config, "internal profile collection error: %s" % exc)
+                    for profile_config in enabled_profiles)
             continue
         try:
             providers.append(fn(cfg))

@@ -7,7 +7,7 @@
         "Icon": "utilities-system-monitor",
         "Id": "org.warikoda.aiusage",
         "Name": "AI Usage",
-        "Version": "0.1.4",
+        "Version": "0.2.0",
         "License": "MIT"
     },
     "X-Plasma-API-Minimum-Version": "6.0"

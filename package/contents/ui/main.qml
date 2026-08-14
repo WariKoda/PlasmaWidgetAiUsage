@@ -13,6 +13,9 @@ PlasmoidItem {
     property string lastError: ""      // non-empty when the last run failed
     property bool loading: false
     property string currentSource: ""  // command of the in-flight helper run
+    property int runSerial: 0
+    readonly property int helperTotalDeadlineMs: 15000
+    readonly property int watchdogMarginMs: 15000
 
     // -- Panel hover tooltip -------------------------------------------------
     toolTipMainText: i18n("AI Usage")
@@ -67,6 +70,8 @@ PlasmoidItem {
     function buildCommand() {
         var env = [];
         env.push("AI_USAGE_PROVIDERS=" + enabledProviders().join(","));
+        env.push("AI_USAGE_CLAUDE_PROFILES_JSON="
+                 + shellQuote(Plasmoid.configuration.claudeProfilesJson));
         if (!Plasmoid.configuration.claudeLocalFallback)
             env.push("AI_USAGE_CLAUDE_LOCAL_FALLBACK=0");
         if (Plasmoid.configuration.claudeExtraUsage)
@@ -89,9 +94,14 @@ PlasmoidItem {
         connectedSources: []
 
         onNewData: function(sourceName, data) {
+            if (sourceName !== root.currentSource) {
+                disconnectSource(sourceName);
+                return;
+            }
             disconnectSource(sourceName);
             watchdog.stop();
             root.loading = false;
+            root.currentSource = "";
             var stdout = (data["stdout"] || "");
             var stderr = (data["stderr"] || "");
             try {
@@ -109,7 +119,8 @@ PlasmoidItem {
     function refresh() {
         if (root.loading) return;
         root.loading = true;
-        root.currentSource = buildCommand();
+        root.runSerial += 1;
+        root.currentSource = "AI_USAGE_RUN_ID=" + root.runSerial + " " + root.buildCommand();
         watchdog.restart();
         executable.exec(root.currentSource);
     }
@@ -124,15 +135,17 @@ PlasmoidItem {
     // Recover from a run whose onNewData never fires: the executable engine can
     // silently fail to deliver, leaving `loading` latched true forever -- after
     // which the refresh Timer bails at `if (root.loading) return` and the widget
-    // freezes on its last report. 30 s is 3x the helper's 10 s HTTP timeout and
-    // well under the default refresh, so it only trips on a genuinely stuck run.
+    // freezes on its last report. The helper gives all Claude profiles one
+    // shared 15 s collection deadline; the additional margin covers the other
+    // bounded providers and executable-engine delivery.
     Timer {
         id: watchdog
-        interval: 30000
+        interval: root.helperTotalDeadlineMs + root.watchdogMarginMs
         repeat: false
         onTriggered: {
             if (root.loading) {
                 executable.disconnectSource(root.currentSource);
+                root.currentSource = "";
                 root.loading = false;
                 root.lastError = i18n("refresh timed out");
             }

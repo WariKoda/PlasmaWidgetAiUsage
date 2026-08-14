@@ -8,16 +8,24 @@ import org.kde.plasma.plasma5support as P5Support
 KCM.SimpleKCM {
     id: page
 
+    // cfg_<name> properties are auto-bound to matching main.xml entries.
+    property string cfg_claudeProfilesJson: "{\"manual\":[],\"overrides\":{}}"
+
+    property var discoveredProfiles: []
+    property string discoveryError: ""
+    property bool discoveryBusy: false
+    property string discoverySource: ""
+    property int discoveryRequestId: 0
+    property bool componentReady: false
+
     property bool managementBusy: false
     property string managementSource: ""
     property string managementAction: ""
+    property string managementProfilePath: ""
     property int managementRequestId: 0
-    property string collectorState: ""
-    property string collectorMessage: ""
-    property string claudeVersion: ""
-    property bool collectorCanSetup: false
-    property string managementError: ""
-    property string pendingActionError: ""
+    property var managementQueue: []
+    property var collectorStatuses: ({})
+    property var pendingActionErrors: ({})
 
     readonly property string helperPath:
         decodeURIComponent(Qt.resolvedUrl("../../code/ai-usage-json")
@@ -27,35 +35,181 @@ KCM.SimpleKCM {
         return "'" + String(value).replace(/'/g, "'\\''") + "'";
     }
 
-    function managementCommand(action, requestId) {
-        return "AI_USAGE_MANAGEMENT_REQUEST_ID=" + requestId
-            + " python3 " + shellQuote(helperPath)
-            + " --claude-integration " + shellQuote(action);
+    function copyObject(source) {
+        var copy = {};
+        if (!source || typeof source !== "object")
+            return copy;
+        for (var key in source)
+            copy[key] = source[key];
+        return copy;
     }
 
-    function runManagement(action) {
-        if (managementBusy)
+    function discoveryCommand() {
+        return "AI_USAGE_CLAUDE_PROFILES_JSON=" + shellQuote(cfg_claudeProfilesJson)
+            + " AI_USAGE_DISCOVERY_REQUEST_ID=" + discoveryRequestId
+            + " python3 " + shellQuote(helperPath) + " --claude-profiles";
+    }
+
+    function runDiscovery() {
+        discoveryRequestId += 1;
+        if (discoverySource.length > 0)
+            discoveryExecutable.disconnectSource(discoverySource);
+        discoverySource = discoveryCommand();
+        discoveryBusy = true;
+        discoveryError = "";
+        discoveryWatchdog.restart();
+        discoveryExecutable.connectSource(discoverySource);
+    }
+
+    function managementCommand(action, profilePath, requestId) {
+        return "AI_USAGE_MANAGEMENT_REQUEST_ID=" + requestId
+            + " python3 " + shellQuote(helperPath)
+            + " --claude-integration " + shellQuote(action)
+            + " --profile " + shellQuote(profilePath);
+    }
+
+    function setCollectorStatus(profilePath, state, message, version,
+                                canSetup, errorMessage) {
+        var statuses = copyObject(collectorStatuses);
+        statuses[profilePath] = {
+            "state": state,
+            "message": message,
+            "claudeVersion": version,
+            "canSetup": canSetup,
+            "error": errorMessage
+        };
+        collectorStatuses = statuses;
+    }
+
+    function setPendingActionError(profilePath, errorMessage) {
+        var errors = copyObject(pendingActionErrors);
+        if (errorMessage.length > 0)
+            errors[profilePath] = errorMessage;
+        else
+            delete errors[profilePath];
+        pendingActionErrors = errors;
+    }
+
+    function pendingActionError(profilePath) {
+        return pendingActionErrors[profilePath]
+            ? String(pendingActionErrors[profilePath]) : "";
+    }
+
+    function combineErrors(first, second) {
+        if (first.length === 0)
+            return second;
+        if (second.length === 0)
+            return first;
+        return first + "\n" + second;
+    }
+
+    function queueProfileStatuses(profiles) {
+        var queue = [];
+        var currentStatuses = {};
+        for (var index = 0; index < profiles.length; ++index) {
+            var profilePath = String(profiles[index].canonical_path || "");
+            if (profilePath.length === 0)
+                continue;
+            currentStatuses[profilePath] = {
+                "state": "",
+                "message": "",
+                "claudeVersion": "",
+                "canSetup": false,
+                "error": ""
+            };
+            queue.push({"action": "status", "profilePath": profilePath});
+        }
+        collectorStatuses = currentStatuses;
+        managementQueue = queue;
+        runNextManagementRequest();
+    }
+
+    function startManagement(action, profilePath) {
+        if (managementBusy || String(profilePath).length === 0)
             return;
         managementBusy = true;
         managementAction = action;
+        managementProfilePath = String(profilePath);
         managementRequestId += 1;
-        managementSource = managementCommand(action, managementRequestId);
+        managementSource = managementCommand(
+            action, managementProfilePath, managementRequestId);
         managementWatchdog.restart();
         managementExecutable.connectSource(managementSource);
     }
 
-    function clearManagementStatus() {
-        collectorState = "";
-        collectorMessage = "";
-        claudeVersion = "";
-        collectorCanSetup = false;
+    function runManagement(action, profilePath) {
+        if (managementBusy)
+            return;
+        startManagement(action, profilePath);
     }
 
-    function invalidateManagementStatus(errorMessage) {
-        clearManagementStatus();
-        managementError = pendingActionError.length > 0
-            ? pendingActionError + "\n" + errorMessage : errorMessage;
-        pendingActionError = "";
+    function runNextManagementRequest() {
+        if (managementBusy || managementQueue.length === 0)
+            return;
+        var queue = managementQueue.slice();
+        var request = queue.shift();
+        managementQueue = queue;
+        startManagement(request.action, request.profilePath);
+    }
+
+    function clearManagementLifecycle() {
+        managementBusy = false;
+        managementSource = "";
+        managementAction = "";
+        managementProfilePath = "";
+    }
+
+    function validManagementResult(result) {
+        return result && typeof result === "object"
+            && typeof result.state === "string"
+            && typeof result.message === "string";
+    }
+
+    P5Support.DataSource {
+        id: discoveryExecutable
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function(sourceName, data) {
+            if (sourceName !== page.discoverySource) {
+                disconnectSource(sourceName);
+                return;
+            }
+
+            disconnectSource(sourceName);
+            discoveryWatchdog.stop();
+            page.discoveryBusy = false;
+            page.discoverySource = "";
+            var stdout = String(data["stdout"] || "");
+            var stderr = String(data["stderr"] || "").trim();
+            if (stderr.length > 0) {
+                page.discoveredProfiles = [];
+                page.discoveryError = stderr;
+                page.queueProfileStatuses([]);
+                return;
+            }
+
+            try {
+                var result = JSON.parse(stdout);
+                if (!result || typeof result !== "object"
+                        || !Array.isArray(result.profiles)) {
+                    throw new Error("invalid profile discovery response");
+                }
+                if (result.ok === false) {
+                    throw new Error(result.error
+                        ? String(result.error)
+                        : "profile discovery failed");
+                }
+                page.discoveredProfiles = result.profiles;
+                page.discoveryError = "";
+                page.queueProfileStatuses(result.profiles);
+            } catch (error) {
+                page.discoveredProfiles = [];
+                page.discoveryError = i18n(
+                    "Could not discover Claude profiles: %1", error);
+                page.queueProfileStatuses([]);
+            }
+        }
     }
 
     P5Support.DataSource {
@@ -71,51 +225,81 @@ KCM.SimpleKCM {
 
             disconnectSource(sourceName);
             managementWatchdog.stop();
+            var action = page.managementAction;
+            var profilePath = page.managementProfilePath;
+            var actionWasStatus = action === "status";
             var stdout = String(data["stdout"] || "");
             var stderr = String(data["stderr"] || "").trim();
-            var actionWasStatus = page.managementAction === "status";
-            page.managementBusy = false;
-            page.managementSource = "";
-            page.managementAction = "";
+            var result = null;
+            var responseError = stderr;
 
-            if (stderr.length > 0) {
-                if (actionWasStatus)
-                    page.invalidateManagementStatus(stderr);
-                else
-                    page.pendingActionError = stderr;
-            } else {
+            if (responseError.length === 0) {
                 try {
-                    var result = JSON.parse(stdout);
-                    if (!result || typeof result !== "object"
-                            || typeof result.state !== "string"
-                            || typeof result.message !== "string") {
+                    result = JSON.parse(stdout);
+                    if (!page.validManagementResult(result))
                         throw new Error("invalid management response");
-                    }
-                    page.collectorState = result.state;
-                    page.collectorMessage = result.message;
-                    page.claudeVersion = result.claude_version
-                        ? String(result.claude_version) : "";
-                    page.collectorCanSetup = result.can_setup === true;
-                    if (actionWasStatus) {
-                        page.managementError = page.pendingActionError;
-                        page.pendingActionError = "";
-                    } else if (result.ok === false) {
-                        page.pendingActionError = result.message;
-                    } else {
-                        page.pendingActionError = "";
-                        page.managementError = "";
-                    }
                 } catch (error) {
-                    var parseError = i18n("Could not read usage collector status: %1", error);
-                    if (actionWasStatus)
-                        page.invalidateManagementStatus(parseError);
-                    else
-                        page.pendingActionError = parseError;
+                    responseError = i18n(
+                        "Could not read usage collector status: %1", error);
                 }
             }
 
+            page.clearManagementLifecycle();
+
+            if (responseError.length > 0) {
+                if (actionWasStatus) {
+                    var earlierError = page.pendingActionError(profilePath);
+                    page.setPendingActionError(profilePath, "");
+                    page.setCollectorStatus(
+                        profilePath, "", "", "", false,
+                        page.combineErrors(earlierError, responseError));
+                } else {
+                    page.setPendingActionError(profilePath, responseError);
+                    page.setCollectorStatus(
+                        profilePath, "", "", "", false, responseError);
+                }
+            } else if (actionWasStatus) {
+                var pendingError = page.pendingActionError(profilePath);
+                page.setPendingActionError(profilePath, "");
+                page.setCollectorStatus(
+                    profilePath,
+                    result.state,
+                    result.message,
+                    result.claude_version ? String(result.claude_version) : "",
+                    result.can_setup === true,
+                    pendingError);
+            } else {
+                var actionError = result.ok === false ? result.message : "";
+                page.setPendingActionError(profilePath, actionError);
+                page.setCollectorStatus(
+                    profilePath,
+                    result.state,
+                    result.message,
+                    result.claude_version ? String(result.claude_version) : "",
+                    result.can_setup === true,
+                    actionError);
+            }
+
             if (!actionWasStatus)
-                page.runManagement("status");
+                page.queueProfileStatuses(page.discoveredProfiles);
+            else
+                page.runNextManagementRequest();
+        }
+    }
+
+    Timer {
+        id: discoveryWatchdog
+        interval: 30000
+        repeat: false
+        onTriggered: {
+            if (!page.discoveryBusy || page.discoverySource.length === 0)
+                return;
+            discoveryExecutable.disconnectSource(page.discoverySource);
+            page.discoveryBusy = false;
+            page.discoverySource = "";
+            page.discoveredProfiles = [];
+            page.discoveryError = i18n("Claude profile discovery timed out.");
+            page.queueProfileStatuses([]);
         }
     }
 
@@ -126,23 +310,29 @@ KCM.SimpleKCM {
         onTriggered: {
             if (!page.managementBusy || page.managementSource.length === 0)
                 return;
-            var actionWasStatus = page.managementAction === "status";
+            var action = page.managementAction;
+            var profilePath = page.managementProfilePath;
+            var actionWasStatus = action === "status";
             managementExecutable.disconnectSource(page.managementSource);
-            page.managementBusy = false;
-            page.managementSource = "";
-            page.managementAction = "";
+            page.clearManagementLifecycle();
             var timeoutError = i18n("Usage collector management timed out.");
             if (actionWasStatus) {
-                page.invalidateManagementStatus(timeoutError);
+                var earlierError = page.pendingActionError(profilePath);
+                page.setPendingActionError(profilePath, "");
+                page.setCollectorStatus(
+                    profilePath, "", "", "", false,
+                    page.combineErrors(earlierError, timeoutError));
             } else {
-                page.clearManagementStatus();
-                page.pendingActionError = timeoutError;
-                page.runManagement("status");
+                page.setPendingActionError(profilePath, timeoutError);
+                page.setCollectorStatus(
+                    profilePath, "", "", "", false, timeoutError);
+                page.queueProfileStatuses(page.discoveredProfiles);
             }
+            if (actionWasStatus)
+                page.runNextManagementRequest();
         }
     }
 
-    // cfg_<name> aliases are auto-bound to the matching main.xml entries.
     property alias cfg_showClaude: showClaude.checked
     property alias cfg_showCodex: showCodex.checked
     property alias cfg_showAntigravity: showAntigravity.checked
@@ -157,6 +347,11 @@ KCM.SimpleKCM {
     property alias cfg_claudeCap5h: cap5h.value
     property alias cfg_claudeCap7d: cap7d.value
     property alias cfg_claudeTokenFile: tokenFileField.text
+
+    onCfg_claudeProfilesJsonChanged: {
+        if (componentReady)
+            runDiscovery();
+    }
 
     Kirigami.FormLayout {
         anchors.fill: parent
@@ -215,54 +410,38 @@ KCM.SimpleKCM {
             id: extraUsage
             text: i18n("Show extra usage")
         }
+
         Controls.Label {
-            Kirigami.FormData.label: i18n("Usage collector:")
-            text: page.collectorMessage.length > 0
-                ? page.collectorMessage
-                : i18n("Checking usage collector status…")
+            Kirigami.FormData.label: i18n("Profiles:")
+            text: page.discoveryBusy
+                ? i18n("Discovering Claude profiles…") : page.discoveryError
+            visible: text.length > 0
+            color: page.discoveryError.length > 0
+                ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
             wrapMode: Text.Wrap
-            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
         }
-        Controls.Label {
-            text: i18n("Claude Code version: %1", page.claudeVersion)
-            visible: page.claudeVersion.length > 0
-            wrapMode: Text.Wrap
-            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
-        }
-        Controls.Label {
-            text: i18n("Claude Code must be installed and signed in first.")
-            visible: page.collectorState === "not-configured"
-                && !page.collectorCanSetup
-            wrapMode: Text.Wrap
-            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
-        }
-        Controls.Label {
-            text: page.managementError
-            visible: page.managementError.length > 0
-            color: Kirigami.Theme.negativeTextColor
-            wrapMode: Text.Wrap
-            Layout.maximumWidth: Kirigami.Units.gridUnit * 24
-        }
-        RowLayout {
-            Controls.Button {
-                text: i18n("Set up usage collector")
-                enabled: !page.managementBusy && page.collectorCanSetup
-                    && page.collectorState !== "configured"
-                onClicked: page.runManagement("setup")
+
+        ClaudeProfilesEditor {
+            id: profileEditor
+            Layout.fillWidth: true
+            Layout.maximumWidth: Kirigami.Units.gridUnit * 30
+            profiles: page.discoveredProfiles
+            configurationJson: page.cfg_claudeProfilesJson
+            collectorStatuses: page.collectorStatuses
+            managementProfilePath: page.managementProfilePath
+
+            onConfigurationEdited: function(configurationJson) {
+                if (page.cfg_claudeProfilesJson !== configurationJson)
+                    page.cfg_claudeProfilesJson = configurationJson;
+                else
+                    page.runDiscovery();
             }
-            Controls.Button {
-                text: i18n("Remove usage collector")
-                visible: page.collectorState === "configured"
-                enabled: !page.managementBusy
-                onClicked: page.runManagement("remove")
-            }
-            Controls.BusyIndicator {
-                running: page.managementBusy
-                visible: running
-                implicitWidth: Kirigami.Units.iconSizes.small
-                implicitHeight: implicitWidth
+            onManagementRequested: function(action, profilePath) {
+                page.runManagement(action, profilePath);
             }
         }
+
         Controls.SpinBox {
             id: cap5h
             Kirigami.FormData.label: i18n("5-hour token cap (0 = off):")
@@ -282,10 +461,13 @@ KCM.SimpleKCM {
         Controls.TextField {
             id: tokenFileField
             Kirigami.FormData.label: i18n("Access token file:")
-            placeholderText: i18n("leave empty to use ~/.claude/.credentials.json")
+            placeholderText: i18n("leave empty to use each profile's credentials")
             Layout.preferredWidth: Kirigami.Units.gridUnit * 16
         }
     }
 
-    Component.onCompleted: page.runManagement("status")
+    Component.onCompleted: {
+        componentReady = true;
+        runDiscovery();
+    }
 }
