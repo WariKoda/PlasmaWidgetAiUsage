@@ -25,24 +25,25 @@ never a fabricated `0 %`.
 
 | Provider | Primary source | Real % ? | Notes |
 |----------|----------------|:--------:|-------|
-| **Claude** | `GET https://api.anthropic.com/api/oauth/usage` (Bearer token from `~/.claude/.credentials.json`) | ✅ | Matches the utilization shown on claude.ai. Optional local token-estimate fallback when the API/token is unavailable. |
-| **Codex** | Newest `~/.codex/sessions/**/rollout-*.jsonl`, last `token_count` event (`payload.rate_limits.primary` / `.secondary`) | ✅ | Purely local — no network. Values and window durations come straight from what the Codex server last reported to the CLI (`window_minutes`). |
-| **Antigravity** | Local `agy` language-server `getUserStatus` Connect RPC — per-model `quotaInfo.remainingFraction` + prompt credits | ✅ | The real signed-in quota the IDE shows, read over loopback (no internet). Its server runs only while Antigravity is open; once closed the tile shows the last-known values marked *cached (stale)*, or *unavailable* if it was never reached. |
+| **Claude** | Claude Code statusline usage collector | ✅ | Claude Code 2.1.80+ supplies its reported 5-hour and 7-day rate-limit windows. The internal OAuth endpoint is a compatibility fallback. The widget discovers `~/.claude` and valid `~/.claude-*` profiles automatically. |
+| **Codex** | Structured local app-server `account/rateLimits/read` | ✅ | Falls back to the newest local session rate-limit event when the app-server is unavailable. The displayed source distinguishes `app-server` from `local-session`. |
+| **Antigravity** | Local `agy` language-server `GetUserStatus` Connect RPC with bounded cache | ✅ | Reads the signed-in quota over loopback while Antigravity is running. A successful response may be cached for only 10 minutes. |
 
-The Claude OAuth usage endpoint is internal/undocumented; the exact response
-shape used here (`five_hour` / `seven_day` with `utilization` + `resets_at`) was
-verified live against a real account, not guessed.
+Expired records and windows are rejected. The widget reports a human-readable
+unavailable state instead of retaining an old percentage or substituting zero.
 
 ## Architecture
 
 ```
 package/contents/
   code/ai-usage-json        # Python 3 (stdlib only) — normalizes all providers to one JSON
+  code/claude-usage-collector # Claude statusline wrapper and private cache writer
   ui/main.qml               # PlasmoidItem: runs the helper via the executable engine, parses JSON
   ui/CompactRepresentation.qml   # panel chips
   ui/FullRepresentation.qml      # popup table
   ui/lib.js                 # formatting + threshold helpers
   ui/config/ConfigGeneral.qml    # settings page
+  ui/config/ClaudeProfilesEditor.qml # dynamic Claude profile rows and row actions
   config/{config.qml,main.xml}   # config registration + keys
 ```
 
@@ -62,6 +63,7 @@ widget sets from its settings:
 | `AI_USAGE_CLAUDE_LOCAL_FALLBACK` | `0` to disable the offline token estimate |
 | `AI_USAGE_CLAUDE_CAP_5H` / `AI_USAGE_CLAUDE_CAP_7D` | token caps to turn the local estimate into a % (0 = show raw tokens) |
 | `AI_USAGE_CLAUDE_TOKEN` | override the access token instead of reading the credentials file |
+| `AI_USAGE_CLAUDE_PROFILES_JSON` | internal widget/helper interface for manually added profile paths and profile preferences; it never contains tokens |
 
 ## Install
 
@@ -90,10 +92,10 @@ sudo kpackagetool6 --type Plasma/Applet --global --install package
 
 Only the widget *code* is shared. Each user still gets their own runtime state —
 the response cache (`~/.cache/plasma-ai-usage/`), the widget settings
-(`~/.config/`), and the credentials it reads (`~/.claude/.credentials.json`,
-`~/.codex/sessions/…`). No tokens or usage data are shared between users; every
-user needs their own CLI credentials (or a per-user token override) for their
-own numbers to show up.
+(`~/.config/`), and their own profile credentials and local history (for
+example `~/.claude-*/.credentials.json` and `~/.codex/sessions/…`). No tokens
+or usage data are shared between users; every user needs their own CLI
+credentials (or a per-user token override) for their own numbers to show up.
 
 ## Configuration
 
@@ -104,23 +106,55 @@ Right-click the widget → *Configure*:
 - **Warning / Critical thresholds** — utilization % at which a value turns
   orange / red.
 - **Panel** — show or hide the reset countdown in the compact view.
+- **Claude profiles** — the widget automatically discovers `~/.claude` plus
+  valid `~/.claude-*` directories. Add arbitrary profile directories manually,
+  then use the individual rows in `ClaudeProfilesEditor.qml` to rename or hide
+  profiles, remove manual entries, and set up or remove each profile's usage
+  collector.
 - **Claude** — enable the local token-estimate fallback, optional 5h/7d token
-  caps, and an access-token override.
+  caps, and an access-token override. With Claude Code 2.1.80 or newer installed
+  and signed in, click **Set up usage collector** in this section. Setup occurs
+  only after this explicit action and preserves an existing statusline command.
+  **Remove usage collector** safely restores the saved configuration when the
+  integration is still managed by this widget.
+
+Collector controls exist only on the settings page; the panel and popup remain
+display-only. Claude Code supplies collector data after it has processed its
+first API response in a session. Its `CLAUDE_CONFIG_DIR` environment variable
+selects the profile whose statusline data is written and read.
+
+Each Claude profile keeps its credentials, local history, OAuth cache, and
+collector cache separate from all other profiles. The profile JSON passed from
+the widget to its helper stores only paths and rename/visibility preferences;
+it never contains access tokens.
+
+## Freshness
+
+- Claude statusline data is valid for 15 minutes. OAuth fallback attempts are
+  limited to once per 15 minutes and a successful response expires after 60
+  minutes.
+- Codex local-session fallback data is valid for 15 minutes.
+- Antigravity's last successful RPC response is valid for 10 minutes.
+
+Every window is also removed after its own reset time. Once a source or window
+expires, its percentage is not displayed.
 
 ## Privacy
 
-Tokens are read from your local CLI credential files and are sent **only** to
-the matching official API host (Anthropic for Claude). Codex data is read from
-local files and Antigravity data from its loopback language server; nothing is
-uploaded anywhere by this widget.
+The collector writes only normalized rate-limit percentages, reset timestamps,
+and a collection timestamp to a private local cache. It does not retain prompts,
+transcript paths, access tokens, account email, or unrelated statusline input.
+An existing statusline command receives its original input unchanged.
+
+The optional Claude OAuth fallback reads the local Claude credential and sends
+it only to Anthropic's API. Codex communicates with the local app-server or
+reads local session events; Antigravity communicates with its loopback language
+server. The widget does not upload provider data elsewhere. Setup status and
+errors are deliberately limited and never expose raw settings or credentials.
 
 ## Status
 
-Early `0.1.0`. Built and verified on Plasma 6.6.5 / Qt 6.10. The Antigravity
-provider reads its quota from the local `agy` language server (live only while
-Antigravity is running). Once closed it serves the last-known values from a local
-cache, marked *cached (stale)* with an age note — never a fabricated fresh number;
-if it was never reached, the tile is *unavailable*.
+Version `0.2.0`. Built and verified on Plasma 6.6.5 / Qt 6.10.
 
 ## License
 

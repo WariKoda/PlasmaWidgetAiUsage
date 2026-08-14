@@ -10,13 +10,16 @@ Item {
     id: pic
 
     property string providerId: ""
+    property string baseProvider: ""
+    readonly property string assetProvider: baseProvider.length > 0
+        ? baseProvider : providerId
     property bool dimmed: false
 
     Image {
         id: logo
         anchors.fill: parent
-        source: pic.providerId.length > 0
-            ? Qt.resolvedUrl("../icons/" + pic.providerId + ".svg")
+        source: pic.assetProvider.length > 0
+            ? Qt.resolvedUrl("../icons/" + pic.assetProvider + ".svg")
             : ""
         sourceSize.width: width
         sourceSize.height: height
@@ -36,11 +39,11 @@ Item {
         border.width: Math.max(1, Math.round(width * 0.1))
         border.color: pic.dimmed
             ? Kirigami.Theme.disabledTextColor
-            : Lib.providerColor(pic.providerId)
+            : Lib.providerColor(pic.assetProvider)
 
         PlasmaComponents.Label {
             anchors.centerIn: parent
-            text: Lib.providerInitial(pic.providerId)
+            text: Lib.providerInitial(pic.assetProvider)
             font.bold: true
             font.pixelSize: Math.round(parent.height * 0.55)
             color: parent.border.color

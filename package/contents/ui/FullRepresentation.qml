@@ -51,15 +51,25 @@ PlasmaComponents.Page {
             Layout.fillWidth: true
         }
 
-        // -- Per-provider sections -------------------------------------------
-        Repeater {
-            model: full.providers
+        PlasmaComponents.ScrollView {
+            id: providerScroll
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            contentWidth: availableWidth
 
-            delegate: ColumnLayout {
-                id: section
-                required property var modelData
-                Layout.fillWidth: true
-                spacing: Kirigami.Units.smallSpacing
+            ColumnLayout {
+                width: providerScroll.availableWidth
+                spacing: Kirigami.Units.largeSpacing
+
+                // -- Per-provider sections -----------------------------------
+                Repeater {
+                    model: full.providers
+
+                    delegate: ColumnLayout {
+                        id: section
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: Kirigami.Units.smallSpacing
 
                 // Provider header: dot + name + plan + data source
                 RowLayout {
@@ -70,6 +80,8 @@ PlasmaComponents.Page {
                         implicitWidth: Kirigami.Units.iconSizes.smallMedium
                         implicitHeight: implicitWidth
                         providerId: section.modelData.id
+                        baseProvider: section.modelData.base_provider
+                            ? section.modelData.base_provider : section.modelData.id
                         dimmed: !section.modelData.available
                         Layout.alignment: Qt.AlignVCenter
                     }
@@ -172,19 +184,19 @@ PlasmaComponents.Page {
                 // Unavailable reason, or a staleness note on an available but
                 // cache-served provider (source == "api-cached" carries its
                 // "cached usage (Xs old) …" note in the error field).
-                PlasmaComponents.Label {
-                    visible: !section.modelData.available || !!section.modelData.error
-                    Layout.fillWidth: true
-                    Layout.leftMargin: Kirigami.Units.iconSizes.small
-                    text: section.modelData.error ? section.modelData.error : i18n("unavailable")
-                    wrapMode: Text.WordWrap
-                    opacity: 0.6
-                    font.italic: true
+                        PlasmaComponents.Label {
+                            visible: !section.modelData.available || !!section.modelData.error
+                            Layout.fillWidth: true
+                            Layout.leftMargin: Kirigami.Units.iconSizes.small
+                            text: section.modelData.error ? section.modelData.error : i18n("unavailable")
+                            wrapMode: Text.WordWrap
+                            opacity: 0.6
+                            font.italic: true
+                        }
+                    }
                 }
             }
         }
-
-        Item { Layout.fillHeight: true }
 
         Kirigami.Separator { Layout.fillWidth: true }
 
