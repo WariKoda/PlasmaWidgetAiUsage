@@ -58,7 +58,9 @@ PlasmaComponents.Page {
             contentWidth: availableWidth
 
             ColumnLayout {
-                width: providerScroll.availableWidth
+                x: Kirigami.Units.smallSpacing
+                width: Math.max(0, providerScroll.availableWidth
+                                - Kirigami.Units.smallSpacing * 2)
                 spacing: Kirigami.Units.largeSpacing
 
                 // -- Per-provider sections -----------------------------------
