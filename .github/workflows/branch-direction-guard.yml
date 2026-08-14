@@ -1,0 +1,23 @@
+name: Branch direction guard
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  branch-direction-guard:
+    name: Branch direction guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject Plasma 5 maintenance branch as source
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ "$HEAD_REF" == "plasma-5.27" ]]; then
+            echo "::error::plasma-5.27 is a one-way maintenance branch and must never be merged into main."
+            exit 1
+          fi
+          echo "Allowed source branch: $HEAD_REF"
