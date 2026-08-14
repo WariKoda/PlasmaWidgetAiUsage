@@ -4,6 +4,9 @@
 ![Plasma 6](https://img.shields.io/badge/Plasma-6-1d99f3.svg)
 ![Qt 6](https://img.shields.io/badge/Qt-6-41cd52.svg)
 
+> This branch targets Plasma 6. For Plasma 5.27, use the
+> [Plasma 5.27 compatibility branch](https://github.com/WariKoda/PlasmaWidgetAiUsage/tree/plasma-5.27).
+
 A configurable Plasma 6 panel widget that shows your AI coding assistant usage
 at a glance: the rolling limit windows with reset countdowns, for
 **Claude Code**, **OpenAI Codex** and **Google Antigravity**.
@@ -158,10 +161,13 @@ Version `0.2.0`. Built and verified on Plasma 6.6.5 / Qt 6.10.
 
 ## Maintenance branches
 
-`main` is the Plasma 6 development line. `plasma-5.27` is a separate,
-long-lived compatibility branch. Shared fixes may flow in one direction only:
-`main` → `plasma-5.27`. The branch must never be merged back into `main`. A
-required repository check enforces this direction for pull requests.
+`main` is the Plasma 6 development line. The
+[Plasma 5.27 compatibility branch](https://github.com/WariKoda/PlasmaWidgetAiUsage/tree/plasma-5.27)
+is a separate, long-lived maintenance line. Shared fixes may flow in one
+direction only: `main` → `plasma-5.27`.
+
+The branch must never be merged back into `main`. A required repository check
+enforces this direction for pull requests.
 
 ## License
 
