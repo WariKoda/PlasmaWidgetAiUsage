@@ -197,6 +197,12 @@ class ClaudeProfileConfigurationContractTests(unittest.TestCase):
         self.assertLess(provider_repeater, separator)
         self.assertLess(separator, refresh_button)
         self.assertIn("Layout.fillHeight: true", source[scroll_view:provider_repeater])
+        self.assertIn("x: Kirigami.Units.smallSpacing", source[scroll_view:provider_repeater])
+        self.assertIn(
+            "width: Math.max(0, providerScroll.availableWidth "
+            "- Kirigami.Units.smallSpacing * 2)",
+            source[scroll_view:provider_repeater],
+        )
 
 
 if __name__ == "__main__":
