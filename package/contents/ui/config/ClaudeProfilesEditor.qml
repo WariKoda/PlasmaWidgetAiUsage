@@ -1,9 +1,7 @@
-pragma ComponentBehavior: Bound
-
-import QtQuick
-import QtQuick.Controls as Controls
-import QtQuick.Layouts
-import org.kde.kirigami as Kirigami
+import QtQuick 2.15
+import QtQuick.Controls 2.15 as Controls
+import QtQuick.Layouts 1.15
+import org.kde.kirigami 2.5 as Kirigami
 
 ColumnLayout {
     id: root

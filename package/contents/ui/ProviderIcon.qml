@@ -1,6 +1,6 @@
-import QtQuick
-import org.kde.plasma.components as PlasmaComponents
-import org.kde.kirigami as Kirigami
+import QtQuick 2.15
+import org.kde.plasma.components 3.0 as PlasmaComponents
+import org.kde.kirigami 2.5 as Kirigami
 import "lib.js" as Lib
 
 // Shows the provider's bundled logo from contents/icons/<id>.svg when present,

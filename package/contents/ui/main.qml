@@ -1,12 +1,13 @@
-pragma ComponentBehavior: Bound
-
-import QtQuick
-import org.kde.plasma.plasmoid
-import org.kde.plasma.plasma5support as P5Support
+import QtQuick 2.15
+import org.kde.plasma.plasmoid 2.0
+import org.kde.plasma.core 2.0 as PlasmaCore
 import "lib.js" as Lib
 
-PlasmoidItem {
+Item {
     id: root
+
+    width: PlasmaCore.Units.gridUnit * 18
+    height: PlasmaCore.Units.gridUnit * 18
 
     // -- Parsed helper output ------------------------------------------------
     property var report: null          // { generated_at, providers: [...] }
@@ -18,8 +19,8 @@ PlasmoidItem {
     readonly property int watchdogMarginMs: 15000
 
     // -- Panel hover tooltip -------------------------------------------------
-    toolTipMainText: i18n("AI Usage")
-    toolTipSubText: buildTooltip()
+    Plasmoid.toolTipMainText: i18n("AI Usage")
+    Plasmoid.toolTipSubText: buildTooltip()
 
     function buildTooltip() {
         if (root.lastError.length > 0)
@@ -88,7 +89,7 @@ PlasmoidItem {
     }
 
     // -- Executable engine: run the helper, parse its JSON --------------------
-    P5Support.DataSource {
+    PlasmaCore.DataSource {
         id: executable
         engine: "executable"
         connectedSources: []
@@ -157,16 +158,16 @@ PlasmoidItem {
     // No forced preferredRepresentation: Plasma then picks by form factor --
     // the compact chips in a panel, the full table as a desktop widget.
 
-    compactRepresentation: CompactRepresentation {
+    Plasmoid.compactRepresentation: CompactRepresentation {
         report: root.report
         loading: root.loading
         warnThreshold: Plasmoid.configuration.warnThreshold
         critThreshold: Plasmoid.configuration.critThreshold
         showReset: Plasmoid.configuration.showResetInCompact
-        onClicked: root.expanded = !root.expanded
+        onClicked: Plasmoid.expanded = !Plasmoid.expanded
     }
 
-    fullRepresentation: FullRepresentation {
+    Plasmoid.fullRepresentation: FullRepresentation {
         report: root.report
         loading: root.loading
         lastError: root.lastError

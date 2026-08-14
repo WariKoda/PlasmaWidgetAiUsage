@@ -9,12 +9,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG="$HERE/package"
 ID="org.warikoda.aiusage"
 
+if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
+    echo "AI Usage requires Python 3.10 or newer." >&2
+    exit 1
+fi
+
 if [[ "${1:-}" == "--system" ]]; then
     DEST="/usr/share/plasma/plasmoids/$ID"
-    KPKG=(sudo kpackagetool6 --type Plasma/Applet --global)
+    KPKG=(sudo kpackagetool5 --type Plasma/Applet --global)
 else
     DEST="$HOME/.local/share/plasma/plasmoids/$ID"
-    KPKG=(kpackagetool6 --type Plasma/Applet)
+    KPKG=(kpackagetool5 --type Plasma/Applet)
 fi
 
 if [[ -d "$DEST" ]]; then
@@ -28,4 +33,4 @@ fi
 echo
 echo "Done. Add it via: right-click panel -> Add Widgets -> 'AI Usage'."
 echo "If it does not show up, rescan the shell:"
-echo "  kquitapp6 plasmashell && kstart plasmashell"
+echo "  kquitapp5 plasmashell && kstart5 plasmashell"

@@ -1,10 +1,10 @@
-# AI Usage — KDE Plasma 6 panel widget
+# AI Usage — KDE Plasma 5.27 panel widget
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Plasma 6](https://img.shields.io/badge/Plasma-6-1d99f3.svg)
-![Qt 6](https://img.shields.io/badge/Qt-6-41cd52.svg)
+![Plasma 5.27](https://img.shields.io/badge/Plasma-5.27-1d99f3.svg)
+![Qt 5.15](https://img.shields.io/badge/Qt-5.15-41cd52.svg)
 
-A configurable Plasma 6 panel widget that shows your AI coding assistant usage
+A configurable Plasma 5.27 panel widget that shows your AI coding assistant usage
 at a glance: the rolling limit windows with reset countdowns, for
 **Claude Code**, **OpenAI Codex** and **Google Antigravity**.
 
@@ -38,7 +38,7 @@ unavailable state instead of retaining an old percentage or substituting zero.
 package/contents/
   code/ai-usage-json        # Python 3 (stdlib only) — normalizes all providers to one JSON
   code/claude-usage-collector # Claude statusline wrapper and private cache writer
-  ui/main.qml               # PlasmoidItem: runs the helper via the executable engine, parses JSON
+  ui/main.qml               # Plasma 5 Item: runs the helper via the executable engine, parses JSON
   ui/CompactRepresentation.qml   # panel chips
   ui/FullRepresentation.qml      # popup table
   ui/lib.js                 # formatting + threshold helpers
@@ -62,21 +62,22 @@ widget sets from its settings:
 | `AI_USAGE_PROVIDERS` | comma list, e.g. `claude,codex,antigravity` |
 | `AI_USAGE_CLAUDE_LOCAL_FALLBACK` | `0` to disable the offline token estimate |
 | `AI_USAGE_CLAUDE_CAP_5H` / `AI_USAGE_CLAUDE_CAP_7D` | token caps to turn the local estimate into a % (0 = show raw tokens) |
-| `AI_USAGE_CLAUDE_TOKEN` | override the access token instead of reading the credentials file |
+| `AI_USAGE_CLAUDE_TOKEN_FILE` | path to an access-token file that overrides profile credentials |
 | `AI_USAGE_CLAUDE_PROFILES_JSON` | internal widget/helper interface for manually added profile paths and profile preferences; it never contains tokens |
 
 ## Install
 
-Requires Plasma 6 / Qt 6 / KF6 and `python3`.
+Requires Plasma 5.27 / Qt 5.15 / KF5 and Python 3.10 or newer. This branch is
+specifically maintained for Plasma 5.27; use the `main` branch for Plasma 6.
 
 ```bash
 # install (or --upgrade to update an existing install)
-kpackagetool6 --type Plasma/Applet --install package
+kpackagetool5 --type Plasma/Applet --install package
 # then: right-click your panel → Add Widgets → "AI Usage"
 ```
 
 A new plasmoid is only picked up after the shell rescans; if it does not appear,
-run `kquitapp6 plasmashell && kstart plasmashell` (this restarts your panel).
+run `kquitapp5 plasmashell && kstart5 plasmashell` (this restarts your panel).
 
 `./install.sh` wraps the install/upgrade choice.
 
@@ -86,7 +87,7 @@ To make the widget available to every user on the machine, install it globally
 with `-g/--global` (writes to `/usr/share/plasma/plasmoids/`, needs root):
 
 ```bash
-sudo kpackagetool6 --type Plasma/Applet --global --install package
+sudo kpackagetool5 --type Plasma/Applet --global --install package
 # or: ./install.sh --system
 ```
 
@@ -112,9 +113,10 @@ Right-click the widget → *Configure*:
   profiles, remove manual entries, and set up or remove each profile's usage
   collector.
 - **Claude** — enable the local token-estimate fallback, optional 5h/7d token
-  caps, and an access-token override. With Claude Code 2.1.80 or newer installed
-  and signed in, click **Set up usage collector** in this section. Setup occurs
-  only after this explicit action and preserves an existing statusline command.
+  caps, and an access-token-file override. With Claude Code 2.1.80 or newer
+  installed and signed in, click **Set up usage collector** in this section.
+  Setup occurs only after this explicit action and preserves an existing
+  statusline command.
   **Remove usage collector** safely restores the saved configuration when the
   integration is still managed by this widget.
 
@@ -154,7 +156,8 @@ errors are deliberately limited and never expose raw settings or credentials.
 
 ## Status
 
-Version `0.2.0`. Built and verified on Plasma 6.6.5 / Qt 6.10.
+Version `0.2.0`, Plasma 5.27 branch. Static compatibility checks target Plasma
+5.27 / Qt 5.15; validation in a real Plasma 5.27 session is still pending.
 
 ## License
 

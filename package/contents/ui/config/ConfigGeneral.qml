@@ -1,12 +1,14 @@
-import QtQuick
-import QtQuick.Controls as Controls
-import QtQuick.Layouts
-import org.kde.kirigami as Kirigami
-import org.kde.kcmutils as KCM
-import org.kde.plasma.plasma5support as P5Support
+import QtQuick 2.15
+import QtQuick.Controls 2.15 as Controls
+import QtQuick.Layouts 1.15
+import org.kde.kirigami 2.5 as Kirigami
+import org.kde.plasma.core 2.0 as PlasmaCore
 
-KCM.SimpleKCM {
+Item {
     id: page
+
+    implicitWidth: formLayout.implicitWidth
+    implicitHeight: formLayout.implicitHeight
 
     // cfg_<name> properties are auto-bound to matching main.xml entries.
     property string cfg_claudeProfilesJson: "{\"manual\":[],\"overrides\":{}}"
@@ -180,7 +182,7 @@ KCM.SimpleKCM {
             && typeof result.message === "string";
     }
 
-    P5Support.DataSource {
+    PlasmaCore.DataSource {
         id: discoveryExecutable
         engine: "executable"
         connectedSources: []
@@ -227,7 +229,7 @@ KCM.SimpleKCM {
         }
     }
 
-    P5Support.DataSource {
+    PlasmaCore.DataSource {
         id: managementExecutable
         engine: "executable"
         connectedSources: []
@@ -369,6 +371,7 @@ KCM.SimpleKCM {
     }
 
     Kirigami.FormLayout {
+        id: formLayout
         anchors.fill: parent
 
         Controls.CheckBox {
