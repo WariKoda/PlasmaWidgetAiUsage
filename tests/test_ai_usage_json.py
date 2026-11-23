@@ -3403,5 +3403,74 @@ class AntigravityProviderTests(unittest.TestCase):
         self.assertEqual(MODULE["antigravity_build"](["bad"]), (None, []))
 
 
+class UserCliResolutionTests(unittest.TestCase):
+    def test_finds_cli_in_fallback_dir_when_missing_from_path(self):
+        with tempfile.TemporaryDirectory() as home:
+            bindir = Path(home) / ".local/npm-global/bin"
+            bindir.mkdir(parents=True)
+            cli = bindir / "codex"
+            cli.write_text("#!/bin/sh\n", encoding="utf-8")
+            cli.chmod(0o755)
+            with mock.patch.dict(os.environ, {"HOME": home, "PATH": "/nonexistent"}):
+                self.assertEqual(MODULE["resolve_cli"]("codex"), str(cli))
+
+    def test_returns_bare_name_when_cli_is_nowhere(self):
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.dict(os.environ, {"HOME": home, "PATH": "/nonexistent"}):
+                self.assertEqual(MODULE["resolve_cli"]("codex"), "codex")
+
+
+class AntigravityCsrfTests(unittest.TestCase):
+    SS_OUTPUT = (
+        'LISTEN 0 511 127.0.0.1:6463 0.0.0.0:* users:(("Discord",pid=10,fd=92))\n'
+        'LISTEN 0 512 127.0.0.1:44045 0.0.0.0:* users:(("language_server",pid=42,fd=18))\n'
+    )
+
+    def test_csrf_token_read_from_process_environment(self):
+        environ = b"A=1\0ANTIGRAVITY_SERVER_CSRF_TOKEN=secret-token\0B=2\0"
+        with mock.patch("builtins.open", mock.mock_open(read_data=environ)) as opened:
+            self.assertEqual(MODULE["antigravity_csrf_token"](42), "secret-token")
+        opened.assert_called_once_with("/proc/42/environ", "rb")
+
+    def test_csrf_token_absent_or_unreadable_is_none(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data=b"A=1\0")):
+            self.assertIsNone(MODULE["antigravity_csrf_token"](42))
+        with mock.patch("builtins.open", side_effect=PermissionError):
+            self.assertIsNone(MODULE["antigravity_csrf_token"](42))
+
+    def test_listening_ports_pair_port_with_owner_token(self):
+        ports_fn = MODULE["antigravity_listening_ports"]
+        completed = subprocess.CompletedProcess([], 0, stdout=self.SS_OUTPUT, stderr="")
+        with mock.patch.object(ports_fn.__globals__["subprocess"], "run", return_value=completed), \
+                mock.patch.dict(ports_fn.__globals__, {
+                    "antigravity_csrf_token": lambda pid: "tok-%d" % pid,
+                }):
+            self.assertEqual(ports_fn(), [(44045, "tok-42")])
+
+    def test_user_status_sends_csrf_header_only_to_localhost(self):
+        status_fn = MODULE["antigravity_user_status"]
+        seen = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout, context):
+            seen.append((req.full_url, req.get_header("X-codeium-csrf-token")))
+            return Response(b'{"userStatus": {"planStatus": {}}}')
+
+        with mock.patch.dict(status_fn.__globals__, {
+                    "antigravity_listening_ports": lambda: [(44045, "tok")],
+                }), \
+                mock.patch.object(status_fn.__globals__["urllib"].request, "urlopen", fake_urlopen):
+            self.assertEqual(status_fn(), {"planStatus": {}})
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0][0].startswith("https://127.0.0.1:44045/"))
+        self.assertEqual(seen[0][1], "tok")
+
+
 if __name__ == "__main__":
     unittest.main()
